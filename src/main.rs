@@ -1,30 +1,32 @@
 use anyhow::{anyhow, Context, Result};
 use log::{error, info, warn};
 use rdev::{listen, Event as KbdEvent, EventType, Key};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
 use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
-    io::Write,
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex},
-    thread,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use x11rb::{
     connection::Connection,
     protocol::{xproto::*, Event as X11Event},
+    rust_connection::RustConnection,
 };
 
+// Конфигурация приложения
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Clone)]
 struct AppConfig {
     window_layout_map: HashMap<String, u8>,
     hotkeys: HashMap<String, String>,
 }
 
+// Состояние модификаторов клавиатуры
 #[derive(Debug, Default)]
 struct ModifierState {
     shift: bool,
@@ -45,19 +47,23 @@ impl ModifierState {
     }
 
     fn matches(&self, required_mods: &HashSet<&str>) -> bool {
-        (required_mods.contains("shift") == self.shift)
-            && (required_mods.contains("ctrl") == self.ctrl)
-            && (required_mods.contains("alt") == self.alt)
-            && (required_mods.contains("meta") == self.meta)
+        required_mods.iter().all(|&modifier| match modifier {
+            "shift" => self.shift,
+            "ctrl" => self.ctrl,
+            "alt" => self.alt,
+            "meta" => self.meta,
+            _ => false,
+        })
     }
 }
 
 struct KeyboardLayoutSwitcher {
     config_path: PathBuf,
     log_path: PathBuf,
-    config: Arc<Mutex<AppConfig>>,
+    config: Arc<AppConfig>,
     last_window_id: Option<u32>,
-    conn: Option<x11rb::rust_connection::RustConnection>,
+    conn: Arc<RustConnection>,
+    root_window: Window,
     net_active_window: Atom,
     wm_class: Atom,
 }
@@ -68,52 +74,87 @@ impl KeyboardLayoutSwitcher {
         let config_path = current_dir.join(config_file);
         let log_path = current_dir.join(log_file);
 
+        // Настройка логгера
         if log_path.exists() {
             fs::remove_file(&log_path).ok();
         }
-
         let log_file = File::create(&log_path)
             .context(format!("Failed to create log file: {}", log_path.display()))?;
-
         WriteLogger::init(LevelFilter::Info, LogConfig::default(), log_file)
             .context("Failed to initialize logger")?;
 
-        info!("Initializing keyboard switcher");
-        let config = AppConfig::load_from_file(&config_path)?;
+        info!("Initializing keyboard layout switcher");
 
-        // Initialize X11 connection and required atoms
-        let (conn, _screen_num) =
-            x11rb::connect(None).context("Failed to connect to X11 server")?;
+        // Инициализация X11 соединения
+        let (conn, screen_num) = x11rb::connect(None)?;
+        let screen = conn.setup().roots[screen_num].clone();
+
         let net_active_window = conn
-            .intern_atom(false, b"_NET_ACTIVE_WINDOW")
-            .context("Failed to intern _NET_ACTIVE_WINDOW atom")?
-            .reply()
-            .context("Failed to get _NET_ACTIVE_WINDOW atom reply")?
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
+            .reply()?
             .atom;
-        let wm_class = conn
-            .intern_atom(false, b"WM_CLASS")
-            .context("Failed to intern WM_CLASS atom")?
-            .reply()
-            .context("Failed to get WM_CLASS atom reply")?
-            .atom;
+
+        let wm_class = conn.intern_atom(false, b"WM_CLASS")?.reply()?.atom;
 
         Ok(Self {
-            config_path,
+            config_path: config_path.clone(),
             log_path,
-            config: Arc::new(Mutex::new(config)),
+            config: Arc::new(AppConfig::load_from_file(&config_path)?),
             last_window_id: None,
-            conn: Some(conn),
+            conn: Arc::new(conn),
+            root_window: screen.root,
             net_active_window,
             wm_class,
         })
     }
 
-    fn get_xkblayout_state_path(&self) -> PathBuf {
-        env::current_exe()
-            .expect("Failed to get executable path")
-            .parent()
-            .expect("No parent directory")
-            .join("xkblayout-state")
+    fn get_active_window(&self) -> Result<u32> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                self.root_window,
+                self.net_active_window,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )?
+            .reply()?;
+
+        reply
+            .value32()
+            .and_then(|mut iter| iter.next())
+            .map(|id| id as u32)
+            .context("No active window found")
+    }
+
+    fn get_window_class(&self, window: u32) -> Result<String> {
+        let reply = self
+            .conn
+            .get_property(false, window, self.wm_class, AtomEnum::STRING, 0, 1024)?
+            .reply()?;
+
+        let value = String::from_utf8_lossy(&reply.value);
+        Regex::new(r#""([^"]*)""#)?
+            .captures(&value)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_lowercase())
+            .context("Failed to parse window class")
+    }
+
+    fn add_current_window(&self) -> Result<()> {
+        let window_id = self.get_active_window()?;
+        let window_class = self.get_window_class(window_id)?;
+        let layout = self.get_current_layout()?;
+
+        let mut config = AppConfig::load_from_file(&self.config_path)?;
+        config
+            .window_layout_map
+            .insert(window_class.clone(), layout);
+        config.save_to_file(&self.config_path)?;
+
+        info!("Added window mapping: {} => {}", window_class, layout);
+        Ok(())
     }
 
     fn str_to_key(key_str: &str) -> Option<Key> {
@@ -190,11 +231,10 @@ impl KeyboardLayoutSwitcher {
         modifiers: &ModifierState,
         hotkey_str: &str,
     ) -> bool {
-        let parts: Vec<&str> = hotkey_str.split_whitespace().collect();
         let mut required_mods = HashSet::new();
         let mut required_key = None;
 
-        for part in parts {
+        for part in hotkey_str.split_whitespace() {
             match part.to_lowercase().as_str() {
                 "shift" => required_mods.insert("shift"),
                 "ctrl" => required_mods.insert("ctrl"),
@@ -202,7 +242,7 @@ impl KeyboardLayoutSwitcher {
                 "meta" | "super" | "win" => required_mods.insert("meta"),
                 key_str => {
                     required_key = Self::str_to_key(key_str);
-                    false
+                    break;
                 }
             };
         }
@@ -211,115 +251,34 @@ impl KeyboardLayoutSwitcher {
             && required_key.map_or(false, |k| pressed_keys.contains(&k))
     }
 
-    fn get_window_class(&self, window_id: u32) -> Option<String> {
-        let conn = self.conn.as_ref()?;
-
-        let reply = conn
-            .get_property(false, window_id, self.wm_class, AtomEnum::ANY, 0, 1024)
-            .ok()?
-            .reply()
-            .ok()?;
-
-        if reply.format == 8 {
-            // 8 means STRING format
-            let value = reply.value;
-            let string = String::from_utf8_lossy(&value);
-
-            // WM_CLASS format is usually "instance\0class\0"
-            let parts: Vec<&str> = string.split('\0').collect();
-            if parts.len() >= 2 {
-                return Some(parts[1].to_lowercase());
-            }
-        }
-
-        None
-    }
-
-    fn get_current_layout(&self) -> Option<u8> {
-        let output = match Command::new(self.get_xkblayout_state_path())
-            .arg("print")
-            .arg("%c")
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                error!("xkblayout-state error: {}", e);
-                return None;
-            }
-        };
-
-        String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
-            .parse::<u8>()
-            .ok()
-    }
-
-    fn add_current_window(&self) -> Result<()> {
-        let conn = self.conn.as_ref().context("X11 connection not available")?;
-        let screen = &conn.setup().roots[0]; // Using first screen
-
-        let reply = conn
-            .get_property(
-                false,
-                screen.root,
-                self.net_active_window,
-                AtomEnum::ANY,
-                0,
-                1,
-            )
-            .context("Failed to get active window")?
-            .reply()
-            .context("Failed to get active window reply")?;
-
-        if reply.value.is_empty() {
-            return Err(anyhow!("No active window found"));
-        }
-
-        let window_id = u32::from_ne_bytes([
-            reply.value[0],
-            reply.value[1],
-            reply.value[2],
-            reply.value[3],
-        ]);
-
-        let window_class = self
-            .get_window_class(window_id)
-            .context("Failed to detect window class")?;
-
-        let layout = self
-            .get_current_layout()
-            .context("Failed to detect current layout")?;
-
-        let mut config = self
-            .config
-            .lock()
-            .map_err(|e| anyhow!("Config lock error: {}", e))?;
-
-        config
-            .window_layout_map
-            .insert(window_class.clone(), layout);
-        config.save_to_file(&self.config_path)?;
-
-        info!("Added mapping: {} => {}", window_class, layout);
-        Ok(())
-    }
-
     fn switch_layout(&self, layout: u8) -> Result<()> {
-        Command::new(self.get_xkblayout_state_path())
+        Command::new("xkblayout-state")
             .arg("set")
             .arg(layout.to_string())
             .status()
             .context("Failed to switch layout")?;
-        info!("Switched layout to {}", layout);
+        info!("Switched keyboard layout to {}", layout);
         Ok(())
+    }
+
+    fn get_current_layout(&self) -> Result<u8> {
+        let output = Command::new("xkblayout-state")
+            .arg("print")
+            .arg("%c")
+            .output()
+            .context("Failed to execute xkblayout-state")?;
+
+        String::from_utf8(output.stdout)?
+            .trim()
+            .parse()
+            .context("Failed to parse layout number")
     }
 
     fn start_keyboard_listener(&self) -> Result<()> {
         let config = Arc::clone(&self.config);
         let switcher = self.clone();
 
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut pressed_keys = HashSet::new();
             let mut modifiers = ModifierState::default();
             let mut last_hotkey = SystemTime::now();
@@ -329,25 +288,17 @@ impl KeyboardLayoutSwitcher {
                     pressed_keys.insert(key.clone());
                     modifiers.update(&key, true);
 
-                    let config = match config.lock() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("Config lock error: {}", e);
-                            return;
-                        }
-                    };
-
                     if let Some(hotkey) = config.hotkeys.get("add_window") {
                         if Self::check_hotkey(&pressed_keys, &modifiers, hotkey) {
                             let now = SystemTime::now();
-                            if let Ok(duration) = now.duration_since(last_hotkey) {
-                                if duration > Duration::from_secs(1) {
-                                    last_hotkey = now;
-                                    let switcher_clone = switcher.clone();
-                                    thread::spawn(move || {
-                                        switcher_clone.add_current_window().ok();
-                                    });
-                                }
+                            if now.duration_since(last_hotkey).unwrap() > Duration::from_secs(1) {
+                                last_hotkey = now;
+                                let switcher = switcher.clone();
+                                std::thread::spawn(move || {
+                                    if let Err(e) = switcher.add_current_window() {
+                                        error!("Failed to add window: {}", e);
+                                    }
+                                });
                             }
                         }
                     }
@@ -367,53 +318,24 @@ impl KeyboardLayoutSwitcher {
         Ok(())
     }
 
-    fn get_active_window(&self) -> Option<u32> {
-        let conn = self.conn.as_ref()?;
-        let screen = &conn.setup().roots[0]; // Using first screen
-
-        let reply = conn
-            .get_property(
-                false,
-                screen.root,
-                self.net_active_window,
-                AtomEnum::ANY,
-                0,
-                1,
-            )
-            .ok()?
-            .reply()
-            .ok()?;
-
-        if reply.value.is_empty() {
-            return None;
-        }
-
-        Some(u32::from_ne_bytes([
-            reply.value[0],
-            reply.value[1],
-            reply.value[2],
-            reply.value[3],
-        ]))
-    }
-
     fn handle_window_change(&mut self, window_id: u32) -> Result<()> {
         if self.last_window_id == Some(window_id) {
             return Ok(());
         }
 
         self.last_window_id = Some(window_id);
+        let window_class = match self.get_window_class(window_id) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to get window class: {}", e);
+                return Ok(());
+            }
+        };
 
-        if let Some(window_class) = self.get_window_class(window_id) {
-            let config = self
-                .config
-                .lock()
-                .map_err(|e| anyhow!("Config lock error: {}", e))?;
-
-            if let Some(target_layout) = config.window_layout_map.get(&window_class) {
-                if let Some(current_layout) = self.get_current_layout() {
-                    if current_layout != *target_layout {
-                        self.switch_layout(*target_layout)?;
-                    }
+        if let Some(target_layout) = self.config.window_layout_map.get(&window_class) {
+            if let Ok(current_layout) = self.get_current_layout() {
+                if current_layout != *target_layout {
+                    self.switch_layout(*target_layout)?;
                 }
             }
         }
@@ -422,35 +344,27 @@ impl KeyboardLayoutSwitcher {
     }
 
     fn run(&mut self) -> Result<()> {
-        info!("Starting keyboard layout switcher (X11 event-based)");
         self.start_keyboard_listener()?;
 
-        let conn = self.conn.take().context("X11 connection not available")?;
-        let screen = &conn.setup().roots[0];
-
-        conn.change_window_attributes(
-            screen.root,
+        self.conn.change_window_attributes(
+            self.root_window,
             &ChangeWindowAttributesAux::default().event_mask(EventMask::PROPERTY_CHANGE),
         )?;
-        conn.flush()?;
+        self.conn.flush()?;
 
-        // Initial window check
-        if let Some(win) = self.get_active_window() {
-            self.handle_window_change(win)?;
+        // Первоначальная проверка активного окна
+        if let Ok(window_id) = self.get_active_window() {
+            self.handle_window_change(window_id)?;
         }
 
         loop {
-            match conn.wait_for_event() {
-                Ok(event) => {
-                    if let X11Event::PropertyNotify(ev) = event {
-                        if ev.atom == self.net_active_window {
-                            if let Some(win) = self.get_active_window() {
-                                self.handle_window_change(win)?;
-                            }
-                        }
+            match self.conn.wait_for_event()? {
+                X11Event::PropertyNotify(event) if event.atom == self.net_active_window => {
+                    if let Ok(window_id) = self.get_active_window() {
+                        self.handle_window_change(window_id)?;
                     }
                 }
-                Err(e) => error!("X11 event error: {}", e),
+                event => warn!("Unexpected X11 event: {:?}", event),
             }
         }
     }
@@ -463,7 +377,8 @@ impl Clone for KeyboardLayoutSwitcher {
             log_path: self.log_path.clone(),
             config: Arc::clone(&self.config),
             last_window_id: self.last_window_id,
-            conn: None, // Not cloned as it can't be safely shared
+            conn: Arc::clone(&self.conn),
+            root_window: self.root_window,
             net_active_window: self.net_active_window,
             wm_class: self.wm_class,
         }
@@ -476,10 +391,9 @@ impl AppConfig {
             let content = fs::read_to_string(path)?;
             Ok(serde_json::from_str(&content)?)
         } else {
-            warn!("Creating new config file");
             let config = AppConfig {
                 window_layout_map: HashMap::new(),
-                hotkeys: HashMap::from([("add_window".into(), "ctrl shift q".into())]),
+                hotkeys: HashMap::from([("add_window".to_string(), "ctrl shift q".to_string())]),
             };
             config.save_to_file(path)?;
             Ok(config)
@@ -487,20 +401,19 @@ impl AppConfig {
     }
 
     fn save_to_file(&self, path: &PathBuf) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
-        let mut file = File::create(path)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(path, json)?;
         Ok(())
     }
 }
 
 fn main() -> Result<()> {
-    let mut switcher = KeyboardLayoutSwitcher::new("config.json", "kbd_switcher.log")?;
+    let mut switcher =
+        KeyboardLayoutSwitcher::new("keyboard-switcher.json", "keyboard-switcher.log")?;
 
     if env::args().any(|arg| arg == "--add") {
         switcher.add_current_window()?;
-        println!("Current window added to config");
+        println!("Current window added to configuration");
     } else {
         switcher.run()?;
     }
