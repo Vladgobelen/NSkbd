@@ -6,17 +6,12 @@
 
 1. Установите зависимости:
 ```bash
-sudo apt install xdotool x11-utils xkblayout-state  # deb
-sudo emerge -av x11-misc/xdotool x11-misc/xkblayout-state x11-apps/xprop  # gentoo
+libx11-dev, xdotool, x11-utils, xprop
 ```
 
-2. Соберите и установите:
+2. Перейдите в нужный каталог, где должна быть софтина, скиньте туда файл build.sh и запустите:
 ```bash
-git clone https://github.com/Vladgobelen/NSkbd
-cd NSkbd
-cargo build --release
-cd target/release/ 
-chmod +x /usr/local/bin/NSKeyboardLayoutSwitcher
+sh build.sh
 ```
 
 ## Использование
@@ -28,20 +23,20 @@ chmod +x /usr/local/bin/NSKeyboardLayoutSwitcher
 
 # Добавить окно в конфиг
 ./NSKeyboardLayoutSwitcher --add
-# или
-sh NSkbd.sh
+# или хоткеем. Хоткей задается в json-конфиге. Конфиг создается при первом запуске программы
 ```
+Пример конфига с хоткеем:
+```json
+{
+  "window_layout_map": {
+    "sublime_text": 0
+  },
+  "hotkeys": {
+    "add_window": "ctrl shift q"
+  }
+}
 
-### Настройка горячих клавиш
-Добавьте в ~/.config/sxhkd/sxhkdrc:
-```bash 
-ctrl + shift  {q}
-    sh /путь/к/NSkbd.sh
 ```
-
-## Конфигурация
-- Настройки: `~/.config/NSKeyboardLayout/config.json`
-- Логи: `~/.config/NSKeyboardLayout/kbd.log`
 
 ## Лицензия
 MIT
