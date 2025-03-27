@@ -198,12 +198,22 @@ impl KeyboardLayoutSwitcher {
     }
 
     fn get_window_class(&self, window_id: u32) -> Option<String> {
-        let wm_class = self
+        // Получаем атом для WM_CLASS
+        let wm_class_atom = self
+            .conn
+            .intern_atom(false, b"WM_CLASS")
+            .ok()?
+            .reply()
+            .ok()?
+            .atom;
+
+        // Получаем свойство WM_CLASS
+        let reply = self
             .conn
             .get_property::<u32, u32>(
                 false,
                 window_id,
-                AtomEnum::WM_CLASS.into(),
+                wm_class_atom,
                 AtomEnum::STRING.into(),
                 0,
                 1024,
@@ -212,16 +222,40 @@ impl KeyboardLayoutSwitcher {
             .reply()
             .ok()?;
 
-        if wm_class.format != 8 || wm_class.value.is_empty() {
+        if reply.format != 8 || reply.value.is_empty() {
+            error!(
+                "Empty or invalid WM_CLASS property for window {}",
+                window_id
+            );
             return None;
         }
 
-        let value = String::from_utf8_lossy(&wm_class.value);
-        Regex::new(r#"([^\0]+)\0[^\0]*\0?$"#)
-            .ok()?
-            .captures(&value)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_lowercase())
+        // WM_CLASS возвращает две строки: instance и class, разделенные нулем
+        let value = String::from_utf8_lossy(&reply.value);
+        let parts: Vec<&str> = value.split('\0').collect();
+
+        if parts.len() < 2 {
+            error!(
+                "Invalid WM_CLASS format for window {}: {:?}",
+                window_id, value
+            );
+            return None;
+        }
+
+        // Берем вторую часть (класс), если она не пустая, иначе первую
+        let class = if !parts[1].is_empty() {
+            parts[1]
+        } else {
+            parts[0]
+        };
+
+        if class.is_empty() {
+            error!("Empty window class for window {}", window_id);
+            return None;
+        }
+
+        info!("Window class for {}: '{}'", window_id, class);
+        Some(class.to_lowercase())
     }
 
     fn get_current_layout(&self) -> Option<u8> {
