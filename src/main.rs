@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context, Result};
-use log::{error, info, warn};
+use log::{debug, error, info};
 use rdev::{listen, Event as KbdEvent, EventType, Key};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
 use std::{
@@ -19,14 +18,12 @@ use x11rb::{
     rust_connection::RustConnection,
 };
 
-// Конфигурация приложения
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Clone)]
 struct AppConfig {
     window_layout_map: HashMap<String, u8>,
     hotkeys: HashMap<String, String>,
 }
 
-// Состояние модификаторов клавиатуры
 #[derive(Debug, Default)]
 struct ModifierState {
     shift: bool,
@@ -74,10 +71,10 @@ impl KeyboardLayoutSwitcher {
         let config_path = current_dir.join(config_file);
         let log_path = current_dir.join(log_file);
 
-        // Настройка логгера
         if log_path.exists() {
             fs::remove_file(&log_path).ok();
         }
+
         let log_file = File::create(&log_path)
             .context(format!("Failed to create log file: {}", log_path.display()))?;
         WriteLogger::init(LevelFilter::Info, LogConfig::default(), log_file)
@@ -85,7 +82,6 @@ impl KeyboardLayoutSwitcher {
 
         info!("Initializing keyboard layout switcher");
 
-        // Инициализация X11 соединения
         let (conn, screen_num) = x11rb::connect(None)?;
         let screen = conn.setup().roots[screen_num].clone();
 
@@ -134,12 +130,25 @@ impl KeyboardLayoutSwitcher {
             .get_property(false, window, self.wm_class, AtomEnum::STRING, 0, 1024)?
             .reply()?;
 
-        let value = String::from_utf8_lossy(&reply.value);
-        Regex::new(r#""([^"]*)""#)?
-            .captures(&value)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_lowercase())
-            .context("Failed to parse window class")
+        let value = reply.value;
+        let first_null = value
+            .iter()
+            .position(|&c| c == 0)
+            .context("Invalid WM_CLASS format (missing first null)")?;
+
+        if value.len() <= first_null + 1 {
+            return Err(anyhow!("WM_CLASS too short"));
+        }
+
+        let class_part = &value[first_null + 1..];
+        let end = class_part
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(class_part.len());
+
+        Ok(String::from_utf8(class_part[..end].to_vec())
+            .context("Invalid UTF-8 in WM_CLASS")?
+            .to_lowercase())
     }
 
     fn add_current_window(&self) -> Result<()> {
@@ -325,7 +334,10 @@ impl KeyboardLayoutSwitcher {
 
         self.last_window_id = Some(window_id);
         let window_class = match self.get_window_class(window_id) {
-            Ok(c) => c,
+            Ok(c) => {
+                debug!("Active window class: {}", c);
+                c
+            }
             Err(e) => {
                 error!("Failed to get window class: {}", e);
                 return Ok(());
@@ -352,7 +364,6 @@ impl KeyboardLayoutSwitcher {
         )?;
         self.conn.flush()?;
 
-        // Первоначальная проверка активного окна
         if let Ok(window_id) = self.get_active_window() {
             self.handle_window_change(window_id)?;
         }
@@ -360,11 +371,12 @@ impl KeyboardLayoutSwitcher {
         loop {
             match self.conn.wait_for_event()? {
                 X11Event::PropertyNotify(event) if event.atom == self.net_active_window => {
-                    if let Ok(window_id) = self.get_active_window() {
-                        self.handle_window_change(window_id)?;
+                    match self.get_active_window() {
+                        Ok(window_id) => self.handle_window_change(window_id)?,
+                        Err(e) => error!("Failed to handle window change: {}", e),
                     }
                 }
-                event => warn!("Unexpected X11 event: {:?}", event),
+                _ => {}
             }
         }
     }
