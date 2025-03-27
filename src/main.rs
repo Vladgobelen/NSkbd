@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use log::{error, info};
-use rdev::{listen, Event, EventType, Key, ListenError};
+use rdev::{listen, Event, EventType, Key};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use simplelog::{Config, LevelFilter, WriteLogger};
@@ -224,36 +224,36 @@ impl NSKeyboardLayoutSwitcher {
             .map(|m| m.as_str().to_lowercase())
     }
 
-    fn get_current_layout(&self) -> Result<u8> {
+    fn get_current_layout(&self) -> Option<u8> {
         let output = Command::new(self.get_xkblayout_state_path())
             .arg("print")
-            .arg("%c") // Используем %c для получения числового кода раскладки
+            .arg("%c")
             .output()
-            .context("Failed to execute xkblayout-state command")?;
+            .ok()?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("xkblayout-state failed: {}", stderr));
+            error!(
+                "xkblayout-state failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
         }
 
-        let layout_str = String::from_utf8(output.stdout)
-            .context("Invalid UTF-8 in xkblayout-state output")?
+        String::from_utf8(output.stdout)
+            .ok()?
             .trim()
-            .to_string();
-
-        layout_str.parse::<u8>().context(format!(
-            "Failed to parse layout number from: '{}'",
-            layout_str
-        ))
+            .parse::<u8>()
+            .map_err(|e| error!("Failed to parse layout: {}", e))
+            .ok()
     }
 
     fn add_current_window(&self) -> Result<()> {
         let window_class = self
             .get_active_window_class()
-            .context("Failed to get window class")?;
+            .context("Failed to detect window class")?;
         let layout = self
             .get_current_layout()
-            .context("Failed to get current layout")?;
+            .context("Failed to detect current layout")?;
 
         let mut config = self.config.lock().unwrap();
         config
@@ -261,7 +261,7 @@ impl NSKeyboardLayoutSwitcher {
             .insert(window_class.clone(), layout);
         config.save_to_file(&self.config_path)?;
 
-        info!("Added window mapping: {} => {}", window_class, layout);
+        info!("Added mapping: {} => {}", window_class, layout);
         Ok(())
     }
 
