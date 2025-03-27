@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context, Result};
 use anyhow::{Context, Result};
 use log::{error, info};
 use rdev::{listen, Event, EventType, Key};
@@ -268,12 +269,10 @@ impl NSKeyboardLayoutSwitcher {
     }
 
     fn add_current_window(&self) -> Result<()> {
-        // Получаем класс активного окна
         let window_class = self
             .get_active_window_class()
             .context("Не удалось определить класс окна")?;
 
-        // Получаем текущую раскладку
         let layout = self
             .get_current_layout()
             .context("Не удалось определить текущую раскладку")?;
@@ -283,26 +282,21 @@ impl NSKeyboardLayoutSwitcher {
             window_class, layout
         );
 
-        // Блокируем доступ к конфигу
+        // Исправленная строка:
         let mut config = self
             .config
             .lock()
             .map_err(|e| anyhow!("Ошибка блокировки конфига: {}", e))?;
 
-        // Добавляем правило
         config
             .window_layout_map
             .insert(window_class.clone(), layout);
 
-        // Сохраняем конфиг
         config
             .save_to_file(&self.config_path)
             .context("Ошибка сохранения конфига")?;
 
-        info!(
-            "Успешно добавлено! Текущие правила: {}",
-            serde_json::to_string_pretty(&*config).unwrap_or_default()
-        );
+        info!("Успешно добавлено!");
 
         Ok(())
     }
