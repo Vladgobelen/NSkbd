@@ -296,6 +296,8 @@ impl NSKeyboardLayoutSwitcher {
 
         let config = Arc::clone(&self.config);
         let config_path = self.config_path.clone();
+        let log_path = self.log_path.clone();
+        let xkblayout_path = self.get_xkblayout_state_path();
 
         thread::spawn(move || {
             let mut pressed_keys = HashSet::new();
@@ -324,15 +326,16 @@ impl NSKeyboardLayoutSwitcher {
                                     last_hotkey = now;
                                     info!("Hotkey detected: {}", hotkey);
 
-                                    // Create temporary switcher instance for window operations
+                                    // Создаем полноценный экземпляр для работы
                                     let temp_switcher = NSKeyboardLayoutSwitcher {
                                         config_path: config_path.clone(),
-                                        log_path: PathBuf::new(), // Not used here
+                                        log_path: log_path.clone(),
                                         config: Arc::clone(&config),
                                         last_window_class: None,
                                         last_config_check: SystemTime::now(),
                                     };
 
+                                    // ВЫЗЫВАЕМ ТОЧНО ТУ ЖЕ ФУНКЦИЮ, ЧТО И ПРИ --add
                                     if let Err(e) = temp_switcher.add_current_window() {
                                         error!("Failed to add window: {}", e);
                                     }
