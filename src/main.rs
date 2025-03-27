@@ -247,21 +247,23 @@ impl NSKeyboardLayoutSwitcher {
             .arg("print")
             .arg("%c")
             .output()
+            .map_err(|e| {
+                error!("Ошибка выполнения xkblayout-state: {}", e); // Добавлено
+                e
+            })
             .ok()?;
 
-        if !output.status.success() {
-            error!(
-                "xkblayout-state failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return None;
-        }
+        // Логируем вывод команды
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        info!("[DEBUG] Вывод xkblayout-state: {:?}", output_str); // Добавлено
 
-        String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
+        output_str
+            .trim() // Убираем пробелы и переносы строк
             .parse::<u8>()
-            .map_err(|e| error!("Failed to parse layout: {}", e))
+            .map_err(|e| {
+                error!("Ошибка парсинга раскладки: {}", e); // Добавлено
+                e
+            })
             .ok()
     }
 
