@@ -290,39 +290,47 @@ impl KeyboardLayoutSwitcher {
             let mut modifiers = ModifierState::default();
             let mut last_hotkey = SystemTime::now();
 
-            let callback = move |event: KbdEvent| match event.event_type {
-                EventType::KeyPress(key) => {
-                    pressed_keys.insert(key.clone());
-                    modifiers.update(&key, true);
+            let callback = move |event: KbdEvent| {
+                match event.event_type {
+                    EventType::KeyPress(key) => {
+                        pressed_keys.insert(key.clone());
+                        modifiers.update(&key, true);
 
-                    let config = match config.lock() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("Config lock error: {}", e);
-                            return;
-                        }
-                    };
+                        // Быстро проверяем хоткей без долгой блокировки
+                        let hotkey = {
+                            let config = match config.lock() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error!("Config lock error: {}", e);
+                                    return;
+                                }
+                            };
+                            config.hotkeys.get("add_window").cloned()
+                        };
 
-                    if let Some(hotkey) = config.hotkeys.get("add_window") {
-                        if Self::check_hotkey(&pressed_keys, &modifiers, hotkey) {
-                            let now = SystemTime::now();
-                            if let Ok(duration) = now.duration_since(last_hotkey) {
-                                if duration > Duration::from_secs(1) {
-                                    last_hotkey = now;
-                                    let switcher_clone = switcher.clone();
-                                    thread::spawn(move || {
-                                        switcher_clone.add_current_window().ok();
-                                    });
+                        if let Some(hotkey) = hotkey {
+                            if Self::check_hotkey(&pressed_keys, &modifiers, &hotkey) {
+                                let now = SystemTime::now();
+                                if let Ok(duration) = now.duration_since(last_hotkey) {
+                                    if duration > Duration::from_secs(1) {
+                                        last_hotkey = now;
+                                        let switcher_clone = switcher.clone();
+                                        thread::spawn(move || {
+                                            if let Err(e) = switcher_clone.add_current_window() {
+                                                error!("Failed to add window: {}", e);
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
+                    EventType::KeyRelease(key) => {
+                        pressed_keys.remove(&key);
+                        modifiers.update(&key, false);
+                    }
+                    _ => {}
                 }
-                EventType::KeyRelease(key) => {
-                    pressed_keys.remove(&key);
-                    modifiers.update(&key, false);
-                }
-                _ => {}
             };
 
             if let Err(e) = listen(callback) {
