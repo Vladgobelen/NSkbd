@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use log::{debug, error, info};
-use rdev::{listen, Event, EventType, Key};
+use log::{error, info};
+use rdev::{listen, Event, EventType, Key, ListenError};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use simplelog::{Config, LevelFilter, WriteLogger};
@@ -308,7 +308,7 @@ impl NSKeyboardLayoutSwitcher {
                         pressed_keys.insert(key.clone());
                         modifiers.update(&key, true);
 
-                        let config = match config.lock() {
+                        let config_guard = match config.lock() {
                             Ok(guard) => guard,
                             Err(e) => {
                                 error!("Mutex poison error in callback: {}", e);
@@ -316,7 +316,7 @@ impl NSKeyboardLayoutSwitcher {
                             }
                         };
 
-                        if let Some(hotkey) = config.hotkeys.get("add_window") {
+                        if let Some(hotkey) = config_guard.hotkeys.get("add_window") {
                             if Self::check_hotkey(&pressed_keys, &modifiers, hotkey) {
                                 let now = SystemTime::now();
                                 if now.duration_since(last_hotkey).unwrap() > Duration::from_secs(1)
@@ -324,39 +324,17 @@ impl NSKeyboardLayoutSwitcher {
                                     last_hotkey = now;
                                     info!("Hotkey detected: {}", hotkey);
 
-                                    // Получаем окно и раскладку
-                                    let window_class = match Self::get_active_window_class() {
-                                        Some(w) => w,
-                                        None => {
-                                            error!("Failed to get window class");
-                                            return;
-                                        }
+                                    // Create temporary switcher instance for window operations
+                                    let temp_switcher = NSKeyboardLayoutSwitcher {
+                                        config_path: config_path.clone(),
+                                        log_path: PathBuf::new(), // Not used here
+                                        config: Arc::clone(&config),
+                                        last_window_class: None,
+                                        last_config_check: SystemTime::now(),
                                     };
 
-                                    let layout = match Self::get_current_layout() {
-                                        Some(l) => l,
-                                        None => {
-                                            error!("Failed to get current layout");
-                                            return;
-                                        }
-                                    };
-
-                                    // Обновляем конфиг
-                                    let mut config = match config.lock() {
-                                        Ok(guard) => guard,
-                                        Err(e) => {
-                                            error!("Mutex poison error: {}", e);
-                                            return;
-                                        }
-                                    };
-
-                                    config
-                                        .window_layout_map
-                                        .insert(window_class.clone(), layout);
-                                    if let Err(e) = config.save_to_file(&config_path) {
-                                        error!("Failed to save config: {}", e);
-                                    } else {
-                                        info!("Saved new mapping: {} => {}", window_class, layout);
+                                    if let Err(e) = temp_switcher.add_current_window() {
+                                        error!("Failed to add window: {}", e);
                                     }
                                 }
                             }
@@ -371,7 +349,7 @@ impl NSKeyboardLayoutSwitcher {
             };
 
             if let Err(e) = listen(callback) {
-                error!("Keyboard listener error: {}", e);
+                error!("Keyboard listener error: {:?}", e);
             }
         });
 
