@@ -224,20 +224,27 @@ impl NSKeyboardLayoutSwitcher {
             .map(|m| m.as_str().to_lowercase())
     }
 
-    fn get_current_layout(&self) -> Option<u8> {
-        Command::new(self.get_xkblayout_state_path())
+    fn get_current_layout(&self) -> Result<u8> {
+        let output = Command::new(self.get_xkblayout_state_path())
             .arg("print")
-            .arg("%s")
+            .arg("%c") // Используем %c для получения числового кода раскладки
             .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| {
-                if s.to_lowercase().contains("ru") {
-                    1
-                } else {
-                    0
-                }
-            })
+            .context("Failed to execute xkblayout-state command")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("xkblayout-state failed: {}", stderr));
+        }
+
+        let layout_str = String::from_utf8(output.stdout)
+            .context("Invalid UTF-8 in xkblayout-state output")?
+            .trim()
+            .to_string();
+
+        layout_str.parse::<u8>().context(format!(
+            "Failed to parse layout number from: '{}'",
+            layout_str
+        ))
     }
 
     fn add_current_window(&self) -> Result<()> {
