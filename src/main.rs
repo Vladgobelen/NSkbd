@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use log::{error, info, warn};
-use rdev::{listen, Event, EventType, Key};
+use rdev::{listen, Event as KbdEvent, EventType, Key};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
@@ -14,6 +14,11 @@ use std::{
     sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime},
+};
+use x11rb::{
+    connection::Connection,
+    protocol::{xproto::*, Event as X11Event},
+    wrapper::ConnectionExt as _,
 };
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Clone)]
@@ -49,14 +54,14 @@ impl ModifierState {
     }
 }
 
-struct NSKeyboardLayoutSwitcher {
+struct KeyboardLayoutSwitcher {
     config_path: PathBuf,
     log_path: PathBuf,
     config: Arc<Mutex<AppConfig>>,
-    last_window_class: Option<String>,
+    last_window_id: Option<u32>,
 }
 
-impl NSKeyboardLayoutSwitcher {
+impl KeyboardLayoutSwitcher {
     fn new(config_file: &str, log_file: &str) -> Result<Self> {
         let current_dir = env::current_dir().context("Failed to get current directory")?;
         let config_path = current_dir.join(config_file);
@@ -79,7 +84,7 @@ impl NSKeyboardLayoutSwitcher {
             config_path,
             log_path,
             config: Arc::new(Mutex::new(config)),
-            last_window_class: None,
+            last_window_id: None,
         })
     }
 
@@ -186,20 +191,10 @@ impl NSKeyboardLayoutSwitcher {
             && required_key.map_or(false, |k| pressed_keys.contains(&k))
     }
 
-    fn get_active_window_class(&self) -> Option<String> {
-        let output = match Command::new("xdotool").arg("getactivewindow").output() {
-            Ok(o) => o,
-            Err(e) => {
-                error!("xdotool error: {}", e);
-                return None;
-            }
-        };
-
-        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
+    fn get_window_class(&self, window_id: u32) -> Option<String> {
         let output = match Command::new("xprop")
             .arg("-id")
-            .arg(&window_id)
+            .arg(window_id.to_string())
             .arg("WM_CLASS")
             .output()
         {
@@ -231,14 +226,6 @@ impl NSKeyboardLayoutSwitcher {
             }
         };
 
-        if !output.status.success() {
-            error!(
-                "xkblayout-state failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return None;
-        }
-
         String::from_utf8(output.stdout)
             .ok()?
             .trim()
@@ -247,8 +234,18 @@ impl NSKeyboardLayoutSwitcher {
     }
 
     fn add_current_window(&self) -> Result<()> {
+        let window_id = Command::new("xdotool")
+            .arg("getactivewindow")
+            .output()
+            .context("Failed to get window ID")?;
+
+        let window_id = String::from_utf8_lossy(&window_id.stdout)
+            .trim()
+            .parse::<u32>()
+            .context("Invalid window ID")?;
+
         let window_class = self
-            .get_active_window_class()
+            .get_window_class(window_id)
             .context("Failed to detect window class")?;
 
         let layout = self
@@ -263,10 +260,7 @@ impl NSKeyboardLayoutSwitcher {
         config
             .window_layout_map
             .insert(window_class.clone(), layout);
-
-        config
-            .save_to_file(&self.config_path)
-            .context("Failed to save config")?;
+        config.save_to_file(&self.config_path)?;
 
         info!("Added mapping: {} => {}", window_class, layout);
         Ok(())
@@ -278,8 +272,7 @@ impl NSKeyboardLayoutSwitcher {
             .arg(layout.to_string())
             .status()
             .context("Failed to switch layout")?;
-
-        info!("Layout switched to {}", layout);
+        info!("Switched layout to {}", layout);
         Ok(())
     }
 
@@ -292,7 +285,7 @@ impl NSKeyboardLayoutSwitcher {
             let mut modifiers = ModifierState::default();
             let mut last_hotkey = SystemTime::now();
 
-            let callback = move |event: Event| match event.event_type {
+            let callback = move |event: KbdEvent| match event.event_type {
                 EventType::KeyPress(key) => {
                     pressed_keys.insert(key.clone());
                     modifiers.update(&key, true);
@@ -335,41 +328,90 @@ impl NSKeyboardLayoutSwitcher {
         Ok(())
     }
 
+    fn get_active_window(&self) -> Option<u32> {
+        let output = Command::new("xdotool")
+            .arg("getactivewindow")
+            .output()
+            .ok()?;
+
+        String::from_utf8(output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()
+    }
+
+    fn handle_window_change(&mut self, window_id: u32) -> Result<()> {
+        if self.last_window_id == Some(window_id) {
+            return Ok(());
+        }
+
+        self.last_window_id = Some(window_id);
+
+        if let Some(window_class) = self.get_window_class(window_id) {
+            let config = self
+                .config
+                .lock()
+                .map_err(|e| anyhow!("Config lock error: {}", e))?;
+
+            if let Some(target_layout) = config.window_layout_map.get(&window_class) {
+                if let Some(current_layout) = self.get_current_layout() {
+                    if current_layout != *target_layout {
+                        self.switch_layout(*target_layout)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<()> {
-        info!("Starting keyboard layout switcher");
+        info!("Starting keyboard layout switcher (X11 event-based)");
         self.start_keyboard_listener()?;
 
+        let (conn, screen_num) = x11rb::connect(None)?;
+        let screen = &conn.setup().roots[screen_num];
+        let net_active_window = conn
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
+            .reply()?
+            .atom;
+
+        conn.change_window_attributes(
+            screen.root,
+            &ChangeWindowAttributesAux::default().event_mask(EventMask::PROPERTY_CHANGE),
+        )?;
+        conn.flush()?;
+
+        // Initial window check
+        if let Some(win) = self.get_active_window() {
+            self.handle_window_change(win)?;
+        }
+
         loop {
-            if let Some(current_class) = self.get_active_window_class() {
-                if self.last_window_class.as_ref() != Some(&current_class) {
-                    self.last_window_class = Some(current_class.clone());
-
-                    let config = self
-                        .config
-                        .lock()
-                        .map_err(|e| anyhow!("Config lock error: {}", e))?;
-
-                    if let Some(target_layout) = config.window_layout_map.get(&current_class) {
-                        if let Some(current_layout) = self.get_current_layout() {
-                            if current_layout != *target_layout {
-                                self.switch_layout(*target_layout)?;
+            match conn.wait_for_event() {
+                Ok(event) => {
+                    if let X11Event::PropertyNotify(ev) = event {
+                        if ev.atom == net_active_window {
+                            if let Some(win) = self.get_active_window() {
+                                self.handle_window_change(win)?;
                             }
                         }
                     }
                 }
+                Err(e) => error!("X11 event error: {}", e),
             }
-            thread::sleep(Duration::from_millis(300));
         }
     }
 }
 
-impl Clone for NSKeyboardLayoutSwitcher {
+impl Clone for KeyboardLayoutSwitcher {
     fn clone(&self) -> Self {
         Self {
             config_path: self.config_path.clone(),
             log_path: self.log_path.clone(),
             config: Arc::clone(&self.config),
-            last_window_class: self.last_window_class.clone(),
+            last_window_id: self.last_window_id,
         }
     }
 }
@@ -400,7 +442,7 @@ impl AppConfig {
 }
 
 fn main() -> Result<()> {
-    let mut switcher = NSKeyboardLayoutSwitcher::new("config.json", "kbd_switcher.log")?;
+    let mut switcher = KeyboardLayoutSwitcher::new("config.json", "kbd_switcher.log")?;
 
     if env::args().any(|arg| arg == "--add") {
         switcher.add_current_window()?;
