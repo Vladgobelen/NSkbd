@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
-use log::{debug, error, info};
+use anyhow::{anyhow, Context, Result};
+use log::{debug, error, info, warn};
 use rdev::{listen, Event, EventType, Key};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use simplelog::{Config, LevelFilter, WriteLogger};
+use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -58,15 +58,26 @@ struct NSKeyboardLayoutSwitcher {
 
 impl NSKeyboardLayoutSwitcher {
     fn new(config_file: &str, log_file: &str) -> Result<Self> {
-        let current_dir = env::current_dir()?;
+        let current_dir = env::current_dir().context("Failed to get current directory")?;
         let config_path = current_dir.join(config_file);
         let log_path = current_dir.join(log_file);
 
-        WriteLogger::init(
-            LevelFilter::Debug,
-            Config::default(),
-            File::create(&log_path).context("Failed to create log file")?,
-        )?;
+        // Удаляем старый лог-файл если существует
+        if log_path.exists() {
+            fs::remove_file(&log_path).ok();
+        }
+
+        let log_file = File::create(&log_path).context(format!(
+            "Failed to create log file at: {}",
+            log_path.display()
+        ))?;
+
+        WriteLogger::init(LevelFilter::Debug, LogConfig::default(), log_file)
+            .context("Failed to initialize logger")?;
+
+        info!("Initializing keyboard switcher...");
+        debug!("Config path: {:?}", config_path);
+        debug!("Log path: {:?}", log_path);
 
         let config = AppConfig::load_from_file(&config_path)?;
 
@@ -167,33 +178,13 @@ impl NSKeyboardLayoutSwitcher {
 
         for part in parts {
             match part.to_lowercase().as_str() {
-                "shift" => {
-                    required_mods.insert("shift");
-                    ()
-                }
-                "ctrl" => {
-                    required_mods.insert("ctrl");
-                    ()
-                }
-                "alt" => {
-                    required_mods.insert("alt");
-                    ()
-                }
-                "meta" => {
-                    required_mods.insert("meta");
-                    ()
-                }
-                "super" => {
-                    required_mods.insert("meta");
-                    ()
-                }
-                "win" => {
-                    required_mods.insert("meta");
-                    ()
-                }
+                "shift" => required_mods.insert("shift"),
+                "ctrl" => required_mods.insert("ctrl"),
+                "alt" => required_mods.insert("alt"),
+                "meta" | "super" | "win" => required_mods.insert("meta"),
                 key_str => {
                     required_key = Self::str_to_key(key_str);
-                    ()
+                    false
                 }
             };
         }
@@ -203,52 +194,84 @@ impl NSKeyboardLayoutSwitcher {
     }
 
     fn get_active_window_class(&self) -> Option<String> {
-        let window_id = Command::new("xdotool")
-            .arg("getactivewindow")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())?;
+        debug!("Getting active window class...");
 
-        let output = Command::new("xprop")
+        let output = match Command::new("xdotool").arg("getactivewindow").output() {
+            Ok(o) => o,
+            Err(e) => {
+                error!("xdotool error: {}", e);
+                return None;
+            }
+        };
+
+        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        debug!("Window ID: {}", window_id);
+
+        let output = match Command::new("xprop")
             .arg("-id")
-            .arg(window_id.trim())
+            .arg(&window_id)
             .arg("WM_CLASS")
             .output()
-            .ok()?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                error!("xprop error: {}", e);
+                return None;
+            }
+        };
 
-        let wm_class = String::from_utf8(output.stdout).ok()?;
-        Regex::new(r#"WM_CLASS.*?"\w+",\s*"(\w+)"#)
-            .ok()?
-            .captures(&wm_class)?
-            .get(1)
-            .map(|m| m.as_str().to_lowercase())
+        let wm_class = String::from_utf8_lossy(&output.stdout);
+        debug!("Raw WM_CLASS output: {}", wm_class);
+
+        let re = Regex::new(r#"WM_CLASS.*?"(?:[^"]*?",\s*)?"([^"]+)"#).unwrap();
+
+        re.captures(&wm_class)
+            .and_then(|caps| caps.get(1))
+            .map(|m| {
+                let class = m.as_str().to_lowercase();
+                debug!("Parsed window class: {}", class);
+                class
+            })
     }
 
     fn get_current_layout(&self) -> Option<u8> {
-        let output = Command::new(self.get_xkblayout_state_path())
+        debug!("Getting current layout...");
+
+        let output = match Command::new(self.get_xkblayout_state_path())
             .arg("print")
             .arg("%c")
             .output()
-            .ok()?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                error!("xkblayout-state execution failed: {}", e);
+                return None;
+            }
+        };
 
         if !output.status.success() {
             error!(
-                "xkblayout-state failed: {}",
+                "xkblayout-state error: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             return None;
         }
 
-        String::from_utf8(output.stdout)
-            .ok()?
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        debug!("xkblayout-state output: {}", output_str);
+
+        output_str
             .trim()
             .parse::<u8>()
-            .map_err(|e| error!("Failed to parse layout: {}", e))
+            .map_err(|e| {
+                error!("Layout parsing failed: {}", e);
+                e
+            })
             .ok()
     }
 
     fn add_current_window(&self) -> Result<()> {
-        info!("Attempting to add current window to config");
+        info!("Adding current window to config...");
 
         let window_class = self
             .get_active_window_class()
@@ -258,55 +281,42 @@ impl NSKeyboardLayoutSwitcher {
             .get_current_layout()
             .context("Failed to detect current layout")?;
 
-        info!("Detected window: {}, layout: {}", window_class, layout);
-
         let mut config = match self.config.lock() {
-            Ok(guard) => guard,
+            Ok(c) => c,
             Err(e) => {
-                error!("Mutex poison error: {}", e);
-                return Err(anyhow::anyhow!("Mutex poison error"));
+                error!("Config lock poisoned: {}", e);
+                return Err(anyhow!("Config lock error"));
             }
         };
 
         config
             .window_layout_map
             .insert(window_class.clone(), layout);
-        info!(
-            "Inserted new mapping into memory: {} => {}",
-            window_class, layout
-        );
 
-        if let Err(e) = config.save_to_file(&self.config_path) {
-            error!("Failed to save config: {}", e);
-            return Err(e);
-        }
+        config
+            .save_to_file(&self.config_path)
+            .context("Failed to save config")?;
 
-        info!("Successfully saved config to {:?}", self.config_path);
+        info!("Successfully added mapping: {} => {}", window_class, layout);
+        debug!("New config state: {:?}", *config);
+
         Ok(())
     }
 
     fn switch_layout(&self, layout: u8) -> Result<()> {
-        info!("Switching to layout {}", layout);
+        info!("Switching layout to {}", layout);
 
-        match Command::new(self.get_xkblayout_state_path())
+        Command::new(self.get_xkblayout_state_path())
             .arg("set")
             .arg(layout.to_string())
             .status()
-        {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => {
-                error!("Failed to switch layout, exit code: {}", status);
-                Err(anyhow::anyhow!("xkblayout-state failed"))
-            }
-            Err(e) => {
-                error!("Failed to execute xkblayout-state: {}", e);
-                Err(e.into())
-            }
-        }
+            .context("Failed to switch layout")?;
+
+        Ok(())
     }
 
     fn start_keyboard_listener(&self) -> Result<()> {
-        info!("Starting keyboard listener");
+        info!("Starting keyboard listener...");
 
         let config = Arc::clone(&self.config);
         let switcher = self.clone();
@@ -320,40 +330,43 @@ impl NSKeyboardLayoutSwitcher {
 
             let callback = move |event: Event| match event.event_type {
                 EventType::KeyPress(key) => {
+                    debug!("Key press: {:?}", key);
                     pressed_keys.insert(key.clone());
                     modifiers.update(&key, true);
 
                     let config = match config.lock() {
-                        Ok(guard) => guard,
+                        Ok(c) => c,
                         Err(e) => {
-                            error!("Mutex poison error in callback: {}", e);
+                            error!("Failed to lock config: {}", e);
                             return;
                         }
                     };
 
                     if let Some(hotkey) = config.hotkeys.get("add_window") {
+                        debug!("Checking hotkey: {}", hotkey);
+
                         if Self::check_hotkey(&pressed_keys, &modifiers, hotkey) {
                             let now = SystemTime::now();
-                            if now.duration_since(last_hotkey).unwrap() > Duration::from_secs(1) {
-                                last_hotkey = now;
-                                info!("Hotkey detected: {}", hotkey);
-
-                                let switcher = switcher.clone();
-                                if let Err(e) = switcher.add_current_window() {
-                                    error!("Failed to add window: {}", e);
+                            if let Ok(duration) = now.duration_since(last_hotkey) {
+                                if duration > Duration::from_secs(1) {
+                                    info!("Hotkey detected!");
+                                    last_hotkey = now;
+                                    if let Err(e) = switcher.add_current_window() {
+                                        error!("Failed to add window: {}", e);
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 EventType::KeyRelease(key) => {
+                    debug!("Key release: {:?}", key);
                     pressed_keys.remove(&key);
                     modifiers.update(&key, false);
                 }
                 _ => {}
             };
 
-            info!("Starting to listen for keyboard events");
             if let Err(e) = listen(callback) {
                 error!("Keyboard listener error: {:?}", e);
             }
@@ -367,25 +380,28 @@ impl NSKeyboardLayoutSwitcher {
 
         self.start_keyboard_listener()?;
 
+        let mut counter = 0;
         loop {
+            counter += 1;
+            debug!("Main loop iteration {}", counter);
+
             if let Some(current_class) = self.get_active_window_class() {
+                debug!("Current window class: {}", current_class);
+
                 if self.last_window_class.as_ref() != Some(&current_class) {
-                    info!("Active window changed to: {}", current_class);
+                    info!("Window focus changed to: {}", current_class);
                     self.last_window_class = Some(current_class.clone());
 
                     let config = match self.config.lock() {
-                        Ok(guard) => guard,
+                        Ok(c) => c,
                         Err(e) => {
-                            error!("Mutex poison error: {}", e);
+                            error!("Config lock poisoned: {}", e);
                             continue;
                         }
                     };
 
                     if let Some(target_layout) = config.window_layout_map.get(&current_class) {
-                        info!(
-                            "Found layout mapping for {}: {}",
-                            current_class, target_layout
-                        );
+                        debug!("Found target layout: {}", target_layout);
 
                         if let Some(current_layout) = self.get_current_layout() {
                             if current_layout != *target_layout {
@@ -394,7 +410,7 @@ impl NSKeyboardLayoutSwitcher {
                                     current_layout, target_layout
                                 );
                                 if let Err(e) = self.switch_layout(*target_layout) {
-                                    error!("Failed to switch layout: {}", e);
+                                    error!("Layout switch failed: {}", e);
                                 }
                             }
                         }
@@ -420,10 +436,16 @@ impl Clone for NSKeyboardLayoutSwitcher {
 
 impl AppConfig {
     fn load_from_file(path: &PathBuf) -> Result<Self> {
+        info!("Loading config from: {:?}", path);
+
         if path.exists() {
-            let content = fs::read_to_string(path)?;
-            serde_json::from_str(&content).context("Failed to parse config file")
+            let content = fs::read_to_string(path)
+                .context(format!("Failed to read config file: {}", path.display()))?;
+
+            serde_json::from_str(&content)
+                .context(format!("Failed to parse config file: {}", path.display()))
         } else {
+            warn!("Config file not found, creating default");
             let config = AppConfig {
                 window_layout_map: HashMap::new(),
                 hotkeys: HashMap::from([("add_window".into(), "ctrl shift q".into())]),
@@ -434,19 +456,31 @@ impl AppConfig {
     }
 
     fn save_to_file(&self, path: &PathBuf) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(path, content)?;
-        Ok(())
+        info!("Saving config to: {:?}", path);
+
+        let content = serde_json::to_string_pretty(self).context("Failed to serialize config")?;
+
+        fs::write(path, content).context(format!("Failed to write config to: {}", path.display()))
     }
 }
 
 fn main() -> Result<()> {
-    let mut switcher = NSKeyboardLayoutSwitcher::new("config.json", "kbd_switcher.log")?;
+    let mut switcher = match NSKeyboardLayoutSwitcher::new("config.json", "kbd_switcher.log") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("FATAL ERROR: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    info!("Application started");
 
     if env::args().any(|arg| arg == "--add") {
+        info!("Running in add mode");
         switcher.add_current_window()?;
         println!("Current window added to config");
     } else {
+        info!("Running in daemon mode");
         switcher.run()?;
     }
 
