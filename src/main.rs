@@ -161,67 +161,85 @@ impl NSKeyboardLayoutSwitcher {
         modifiers: &ModifierState,
         hotkey_str: &str,
     ) -> bool {
+        info!("[DEBUG] Checking hotkey: {}", hotkey_str);
+
         let parts: Vec<&str> = hotkey_str.split_whitespace().collect();
         let mut required_mods = HashSet::new();
         let mut required_key = None;
 
         for part in parts {
-            match part.to_lowercase().as_str() {
-                "shift" => {
-                    required_mods.insert("shift");
-                    true
-                }
-                "ctrl" => {
-                    required_mods.insert("ctrl");
-                    true
-                }
-                "alt" => {
-                    required_mods.insert("alt");
-                    true
-                }
-                "meta" => {
-                    required_mods.insert("meta");
-                    true
-                }
-                "super" => {
-                    required_mods.insert("meta");
-                    true
-                }
-                "win" => {
-                    required_mods.insert("meta");
-                    true
-                }
-                key_str => {
-                    required_key = Self::str_to_key(key_str);
+            let lower_part = part.to_lowercase();
+            match lower_part.as_str() {
+                "shift" => required_mods.insert("shift"),
+                "ctrl" => required_mods.insert("ctrl"),
+                "alt" => required_mods.insert("alt"),
+                "meta" | "super" | "win" => required_mods.insert("meta"),
+                _ => {
+                    required_key = Self::str_to_key(&lower_part);
                     false
                 }
             };
         }
 
-        modifiers.matches(&required_mods)
-            && required_key.map_or(false, |k| pressed_keys.contains(&k))
+        info!("[DEBUG] Parsed hotkey components:");
+        info!("  - Required mods: {:?}", required_mods);
+        info!("  - Required key: {:?}", required_key);
+        info!("[DEBUG] Current state:");
+        info!("  - Pressed keys: {:?}", pressed_keys);
+        info!("  - Modifiers: {:?}", modifiers);
+
+        let mods_ok = modifiers.matches(&required_mods);
+        let key_ok = required_key.map_or(false, |k| pressed_keys.contains(&k));
+
+        info!(
+            "[DEBUG] Match result: mods_ok={}, key_ok={}",
+            mods_ok, key_ok
+        );
+
+        mods_ok && key_ok
     }
 
     fn get_active_window_class(&self) -> Option<String> {
-        let window_id = Command::new("xdotool")
+        let output = Command::new("xdotool")
             .arg("getactivewindow")
             .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())?;
+            .map_err(|e| {
+                error!("[ERROR] xdotool failed: {}", e);
+                e
+            })
+            .ok()?;
+
+        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        info!("[DEBUG] Active window ID: {}", window_id);
 
         let output = Command::new("xprop")
             .arg("-id")
-            .arg(window_id.trim())
+            .arg(&window_id)
             .arg("WM_CLASS")
             .output()
+            .map_err(|e| {
+                error!("[ERROR] xprop failed: {}", e);
+                e
+            })
             .ok()?;
 
-        let wm_class = String::from_utf8(output.stdout).ok()?;
-        Regex::new(r#"WM_CLASS.*?"\w+",\s*"(\w+)"#)
-            .ok()?
-            .captures(&wm_class)?
-            .get(1)
-            .map(|m| m.as_str().to_lowercase())
+        let wm_class = String::from_utf8_lossy(&output.stdout);
+        info!("[DEBUG] Raw WM_CLASS output:\n{}", wm_class);
+
+        let re = Regex::new(r#"WM_CLASS.*?"(?:.*?",\s*)?"([^"]+)"#).unwrap();
+        let captures = re.captures(&wm_class);
+
+        match captures {
+            Some(caps) => {
+                let class = caps.get(1).unwrap().as_str().to_lowercase();
+                info!("[DEBUG] Parsed window class: {}", class);
+                Some(class)
+            }
+            None => {
+                error!("[ERROR] Failed to parse WM_CLASS");
+                None
+            }
+        }
     }
 
     fn get_current_layout(&self) -> Option<u8> {
@@ -322,13 +340,22 @@ impl NSKeyboardLayoutSwitcher {
 
         loop {
             if let Some(current_class) = self.get_active_window_class() {
+                info!("[DEBUG] Current window class: {}", current_class);
+
                 if self.last_window_class.as_ref() != Some(&current_class) {
-                    self.last_window_class = Some(current_class.clone());
+                    info!("[DEBUG] Window class changed");
 
                     let config = self.config.lock().unwrap();
+                    info!("[DEBUG] Current config: {:?}", *config);
+
                     if let Some(target_layout) = config.window_layout_map.get(&current_class) {
+                        info!("[DEBUG] Found layout mapping: {}", target_layout);
+
                         if let Some(current_layout) = self.get_current_layout() {
+                            info!("[DEBUG] Current layout: {}", current_layout);
+
                             if current_layout != *target_layout {
+                                info!("[DEBUG] Switching layout to {}", target_layout);
                                 self.switch_layout(*target_layout)?;
                             }
                         }
@@ -368,8 +395,19 @@ impl AppConfig {
     }
 
     fn save_to_file(&self, path: &PathBuf) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(path, content)?;
+        let content = serde_json::to_string_pretty(self).map_err(|e| {
+            error!("[ERROR] JSON serialization failed: {}", e);
+            e
+        })?;
+
+        info!("[DEBUG] Saving config content:\n{}", content);
+
+        fs::write(path, content).map_err(|e| {
+            error!("[ERROR] File write failed: {}", e);
+            e
+        })?;
+
+        info!("[SUCCESS] Config saved successfully");
         Ok(())
     }
 }
