@@ -18,7 +18,6 @@ use std::{
 use x11rb::{
     connection::Connection,
     protocol::{xproto::*, Event as X11Event},
-    wrapper::ConnectionExt as _,
 };
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Clone)]
