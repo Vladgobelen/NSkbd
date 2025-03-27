@@ -314,27 +314,36 @@ impl Clone for NSKeyboardLayoutSwitcher {
 
 impl AppConfig {
     fn load_from_file(path: &PathBuf) -> Result<Self> {
-        // 1. Удаляем проверку exists() — просто пробуем прочитать файл
-        let result = fs::read_to_string(path).and_then(|content| {
-            serde_json::from_str(&content)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        });
+        if path.exists() {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config file: {:?}", path))?;
+            let mut config: AppConfig =
+                serde_json::from_str(&content).with_context(|| "Failed to parse config")?;
 
-        match result {
-            Ok(config) => Ok(config),
-            Err(_) => {
-                // 2. Если ошибка (файла нет или он битый) — создаём новый конфиг
-                let default_config = AppConfig {
-                    window_layout_map: HashMap::new(),
-                    hotkeys: [("add_window".to_string(), "ctrl shift q".to_string())]
-                        .iter()
-                        .cloned()
-                        .collect(),
-                };
-                default_config.save_to_file(path)?;
-                Ok(default_config)
+            if !config.hotkeys.contains_key("add_window") {
+                config
+                    .hotkeys
+                    .insert("add_window".to_string(), "ctrl shift q".to_string());
+                config.save_to_file(path)?;
             }
+
+            Ok(config)
+        } else {
+            let default_config = AppConfig {
+                window_layout_map: HashMap::new(),
+                hotkeys: [("add_window".to_string(), "ctrl shift q".to_string())]
+                    .iter()
+                    .cloned()
+                    .collect(),
+            };
+            default_config.save_to_file(path)?;
+            Ok(default_config)
         }
+    }
+
+    fn save_to_file(&self, path: &PathBuf) -> Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(path, content).with_context(|| format!("Failed to write config to {:?}", path))
     }
 }
 
