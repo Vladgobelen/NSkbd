@@ -167,13 +167,34 @@ impl NSKeyboardLayoutSwitcher {
 
         for part in parts {
             match part.to_lowercase().as_str() {
-                "shift" => required_mods.insert("shift"),
-                "ctrl" => required_mods.insert("ctrl"),
-                "alt" => required_mods.insert("alt"),
-                "meta" => required_mods.insert("meta"),
-                "super" => required_mods.insert("meta"),
-                "win" => required_mods.insert("meta"),
-                key_str => required_key = Self::str_to_key(key_str),
+                "shift" => {
+                    required_mods.insert("shift");
+                    ()
+                }
+                "ctrl" => {
+                    required_mods.insert("ctrl");
+                    ()
+                }
+                "alt" => {
+                    required_mods.insert("alt");
+                    ()
+                }
+                "meta" => {
+                    required_mods.insert("meta");
+                    ()
+                }
+                "super" => {
+                    required_mods.insert("meta");
+                    ()
+                }
+                "win" => {
+                    required_mods.insert("meta");
+                    ()
+                }
+                key_str => {
+                    required_key = Self::str_to_key(key_str);
+                    ()
+                }
             };
         }
 
@@ -239,21 +260,6 @@ impl NSKeyboardLayoutSwitcher {
 
         info!("Detected window: {}, layout: {}", window_class, layout);
 
-        // Проверка прав на запись
-        if let Err(e) = fs::metadata(&self.config_path).and_then(|m| {
-            if m.permissions().readonly() {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Config file is read-only",
-                ))
-            } else {
-                Ok(())
-            }
-        }) {
-            error!("Config file not writable: {}", e);
-            return Err(e.into());
-        }
-
         let mut config = match self.config.lock() {
             Ok(guard) => guard,
             Err(e) => {
@@ -261,8 +267,6 @@ impl NSKeyboardLayoutSwitcher {
                 return Err(anyhow::anyhow!("Mutex poison error"));
             }
         };
-
-        debug!("Config before changes: {:?}", *config);
 
         config
             .window_layout_map
@@ -272,25 +276,13 @@ impl NSKeyboardLayoutSwitcher {
             window_class, layout
         );
 
-        debug!("Config after changes: {:?}", *config);
-
-        match config.save_to_file(&self.config_path) {
-            Ok(_) => {
-                info!("Successfully saved config to {:?}", self.config_path);
-                if let Ok(content) = fs::read_to_string(&self.config_path) {
-                    debug!("Current config file content:\n{}", content);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to save config: {}", e);
-                debug!(
-                    "Config file exists after error: {}",
-                    self.config_path.exists()
-                );
-                Err(e)
-            }
+        if let Err(e) = config.save_to_file(&self.config_path) {
+            error!("Failed to save config: {}", e);
+            return Err(e);
         }
+
+        info!("Successfully saved config to {:?}", self.config_path);
+        Ok(())
     }
 
     fn switch_layout(&self, layout: u8) -> Result<()> {
@@ -442,28 +434,9 @@ impl AppConfig {
     }
 
     fn save_to_file(&self, path: &PathBuf) -> Result<()> {
-        debug!("Attempting to save config to {:?}", path);
-
-        let content = match serde_json::to_string_pretty(self) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Serialization error: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        debug!("Serialized config content:\n{}", content);
-
-        match fs::write(path, content) {
-            Ok(_) => {
-                debug!("Config successfully written to file");
-                Ok(())
-            }
-            Err(e) => {
-                error!("File write error: {} (path: {:?})", e, path);
-                Err(e.into())
-            }
-        }
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(path, content)?;
+        Ok(())
     }
 }
 
