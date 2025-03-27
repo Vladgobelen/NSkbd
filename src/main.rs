@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use rdev::{listen, Event as KbdEvent, EventType, Key};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -18,6 +18,7 @@ use std::{
 use x11rb::{
     connection::Connection,
     protocol::{xproto::*, Event as X11Event},
+    rust_connection::RustConnection,
 };
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Clone)]
@@ -75,7 +76,7 @@ impl KeyboardLayoutSwitcher {
         let log_file = File::create(&log_path)
             .context(format!("Failed to create log file: {}", log_path.display()))?;
 
-        WriteLogger::init(LevelFilter::Info, LogConfig::default(), log_file)
+        WriteLogger::init(LevelFilter::Debug, LogConfig::default(), log_file)
             .context("Failed to initialize logger")?;
 
         info!("Initializing keyboard switcher");
@@ -91,7 +92,7 @@ impl KeyboardLayoutSwitcher {
         })
     }
 
-    fn setup_x11_connection(&mut self) -> Result<(impl Connection, usize)> {
+    fn setup_x11_connection(&mut self) -> Result<(RustConnection, usize)> {
         let (conn, screen_num) = x11rb::connect(None)?;
 
         self.wm_class_atom = conn.intern_atom(false, b"WM_CLASS")?.reply()?.atom;
@@ -204,77 +205,144 @@ impl KeyboardLayoutSwitcher {
     }
 
     fn get_window_class(&self, conn: &impl Connection, window: u32) -> Option<String> {
-        let reply = conn
-            .get_property(
-                false,
-                window,
-                self.wm_class_atom,
-                self.utf8_string_atom,
-                0,
-                1024,
-            )
-            .ok()?
-            .reply()
-            .ok()?;
+        let reply = match conn.get_property(
+            false,
+            window,
+            self.wm_class_atom,
+            self.utf8_string_atom,
+            0,
+            1024,
+        ) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => reply,
+                Err(e) => {
+                    error!("Failed to get property reply: {}", e);
+                    return None;
+                }
+            },
+            Err(e) => {
+                error!("Failed to get window property: {}", e);
+                return None;
+            }
+        };
 
-        String::from_utf8(reply.value).ok().and_then(|s| {
-            s.split('\0')
+        match String::from_utf8(reply.value) {
+            Ok(s) => s
+                .split('\0')
                 .next()
-                .map(|class| class.trim().to_lowercase())
-        })
+                .map(|class| class.trim().to_lowercase()),
+            Err(e) => {
+                error!("Invalid UTF-8 in window class: {}", e);
+                None
+            }
+        }
     }
 
     fn get_current_layout(&self) -> Option<u8> {
-        let output = Command::new(self.get_xkblayout_state_path())
+        let output = match Command::new(self.get_xkblayout_state_path())
             .arg("print")
             .arg("%c")
             .output()
-            .ok()?;
+        {
+            Ok(output) => output,
+            Err(e) => {
+                error!("Failed to execute xkblayout-state: {}", e);
+                return None;
+            }
+        };
 
-        String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
-            .parse::<u8>()
-            .ok()
+        if !output.status.success() {
+            error!(
+                "xkblayout-state failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+
+        match String::from_utf8(output.stdout) {
+            Ok(s) => match s.trim().parse::<u8>() {
+                Ok(layout) => Some(layout),
+                Err(e) => {
+                    error!("Failed to parse layout: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                error!("Invalid UTF-8 from xkblayout-state: {}", e);
+                None
+            }
+        }
     }
 
     fn add_current_window(&mut self, conn: &impl Connection) -> Result<()> {
-        let active_win = self.get_active_window(conn)?;
-        let window_class = self
-            .get_window_class(conn, active_win)
-            .context("Failed to detect window class")?;
+        info!("Attempting to add current window to config");
 
-        let layout = self
-            .get_current_layout()
-            .context("Failed to detect current layout")?;
+        let active_win = match self.get_active_window(conn) {
+            Ok(win) => win,
+            Err(e) => {
+                error!("Failed to get active window: {}", e);
+                return Err(e);
+            }
+        };
 
-        let mut config = self
-            .config
-            .lock()
-            .map_err(|e| anyhow!("Config lock error: {}", e))?;
+        let window_class = match self.get_window_class(conn, active_win) {
+            Some(class) => class,
+            None => return Err(anyhow!("Failed to detect window class")),
+        };
 
+        let layout = match self.get_current_layout() {
+            Some(layout) => layout,
+            None => return Err(anyhow!("Failed to detect current layout")),
+        };
+
+        let mut config = match self.config.lock() {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Config lock error: {}", e);
+                return Err(anyhow!("Config lock error"));
+            }
+        };
+
+        info!("Adding window mapping: {} => {}", window_class, layout);
         config
             .window_layout_map
             .insert(window_class.clone(), layout);
-        config.save_to_file(&self.config_path)?;
 
-        info!("Added mapping: {} => {}", window_class, layout);
+        if let Err(e) = config.save_to_file(&self.config_path) {
+            error!("Failed to save config: {}", e);
+            return Err(e);
+        }
+
+        info!("Successfully added mapping: {} => {}", window_class, layout);
         Ok(())
     }
 
     fn switch_layout(&self, layout: u8) -> Result<()> {
-        Command::new(self.get_xkblayout_state_path())
+        info!("Switching layout to {}", layout);
+        match Command::new(self.get_xkblayout_state_path())
             .arg("set")
             .arg(layout.to_string())
             .status()
-            .context("Failed to switch layout")?;
-        info!("Switched layout to {}", layout);
-        Ok(())
+        {
+            Ok(status) if status.success() => {
+                info!("Successfully switched layout to {}", layout);
+                Ok(())
+            }
+            Ok(status) => {
+                error!("Failed to switch layout, exit code: {:?}", status.code());
+                Err(anyhow!("Failed to switch layout"))
+            }
+            Err(e) => {
+                error!("Failed to execute layout switch: {}", e);
+                Err(e.into())
+            }
+        }
     }
 
-    fn start_keyboard_listener(&self) -> Result<()> {
+    fn start_keyboard_listener(&mut self) -> Result<()> {
+        info!("Starting keyboard listener");
         let config = Arc::clone(&self.config);
-        let mut switcher = self.clone();
+        let config_path = self.config_path.clone();
 
         thread::spawn(move || {
             let mut pressed_keys = HashSet::new();
@@ -283,6 +351,7 @@ impl KeyboardLayoutSwitcher {
 
             let callback = move |event: KbdEvent| match event.event_type {
                 EventType::KeyPress(key) => {
+                    debug!("Key pressed: {:?}", key);
                     pressed_keys.insert(key.clone());
                     modifiers.update(&key, true);
 
@@ -300,8 +369,161 @@ impl KeyboardLayoutSwitcher {
                             if let Ok(duration) = now.duration_since(last_hotkey) {
                                 if duration > Duration::from_secs(1) {
                                     last_hotkey = now;
-                                    if let Ok((conn, _)) = switcher.setup_x11_connection() {
-                                        switcher.add_current_window(&conn).ok();
+                                    info!("Detected hotkey combination");
+
+                                    match x11rb::connect(None) {
+                                        Ok((conn, _)) => {
+                                            let wm_class_atom = match conn
+                                                .intern_atom(false, b"WM_CLASS")
+                                            {
+                                                Ok(cookie) => {
+                                                    match cookie.reply() {
+                                                        Ok(reply) => reply.atom,
+                                                        Err(e) => {
+                                                            error!("Failed to get WM_CLASS atom reply: {}", e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to intern WM_CLASS atom: {}", e);
+                                                    return;
+                                                }
+                                            };
+
+                                            let net_active_window = match conn
+                                                .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+                                            {
+                                                Ok(cookie) => match cookie.reply() {
+                                                    Ok(reply) => reply.atom,
+                                                    Err(e) => {
+                                                        error!("Failed to get _NET_ACTIVE_WINDOW atom reply: {}", e);
+                                                        return;
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    error!("Failed to intern _NET_ACTIVE_WINDOW atom: {}", e);
+                                                    return;
+                                                }
+                                            };
+
+                                            let active_win = match conn.get_property(
+                                                false,
+                                                conn.setup().roots[0].root,
+                                                net_active_window,
+                                                AtomEnum::WINDOW,
+                                                0,
+                                                1,
+                                            ) {
+                                                Ok(cookie) => {
+                                                    match cookie.reply() {
+                                                        Ok(reply) => reply
+                                                            .value32()
+                                                            .and_then(|mut i| i.next())
+                                                            .unwrap_or(0),
+                                                        Err(e) => {
+                                                            error!("Failed to get active window reply: {}", e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to get active window: {}", e);
+                                                    return;
+                                                }
+                                            };
+
+                                            let window_class = match conn.get_property(
+                                                false,
+                                                active_win,
+                                                wm_class_atom,
+                                                AtomEnum::STRING,
+                                                0,
+                                                1024,
+                                            ) {
+                                                Ok(cookie) => match cookie.reply() {
+                                                    Ok(reply) => {
+                                                        match String::from_utf8(reply.value) {
+                                                            Ok(s) => s
+                                                                .split('\0')
+                                                                .next()
+                                                                .map(|c| c.trim().to_lowercase())
+                                                                .unwrap_or_default(),
+                                                            Err(e) => {
+                                                                error!("Invalid UTF-8 in window class: {}", e);
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Failed to get window class reply: {}",
+                                                            e
+                                                        );
+                                                        return;
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    error!("Failed to get window class: {}", e);
+                                                    return;
+                                                }
+                                            };
+
+                                            let layout = match Command::new("xkblayout-state")
+                                                .arg("print")
+                                                .arg("%c")
+                                                .output()
+                                            {
+                                                Ok(output) if output.status.success() => {
+                                                    match String::from_utf8(output.stdout) {
+                                                        Ok(s) => {
+                                                            match s.trim().parse::<u8>() {
+                                                                Ok(layout) => layout,
+                                                                Err(e) => {
+                                                                    error!("Failed to parse layout: {}", e);
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("Invalid UTF-8 from xkblayout-state: {}", e);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    error!("Failed to get current layout");
+                                                    return;
+                                                }
+                                            };
+
+                                            info!(
+                                                "Adding window mapping: {} => {}",
+                                                window_class, layout
+                                            );
+                                            let mut local_config =
+                                                match AppConfig::load_from_file(&config_path) {
+                                                    Ok(c) => c,
+                                                    Err(e) => {
+                                                        error!("Failed to load config: {}", e);
+                                                        return;
+                                                    }
+                                                };
+
+                                            local_config
+                                                .window_layout_map
+                                                .insert(window_class, layout);
+
+                                            if let Err(e) = local_config.save_to_file(&config_path)
+                                            {
+                                                error!("Failed to save config: {}", e);
+                                            } else {
+                                                info!("Config saved successfully");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to connect to X11 server: {}", e);
+                                        }
                                     }
                                 }
                             }
@@ -329,7 +551,7 @@ impl KeyboardLayoutSwitcher {
             .reply()?
             .atom;
         let reply = conn
-            .get_property::<u32, _>(
+            .get_property(
                 false,
                 conn.setup().roots[0].root,
                 net_active_window,
@@ -372,6 +594,13 @@ impl KeyboardLayoutSwitcher {
 
     fn run(&mut self) -> Result<()> {
         info!("Starting keyboard layout switcher (X11 event-based)");
+
+        {
+            let config = self.config.lock().unwrap();
+            info!("Current config: {:?}", *config);
+            info!("Hotkeys: {:?}", config.hotkeys);
+        }
+
         self.start_keyboard_listener()?;
 
         let (conn, screen_num) = self.setup_x11_connection()?;
@@ -387,7 +616,6 @@ impl KeyboardLayoutSwitcher {
         )?;
         conn.flush()?;
 
-        // Initial window check
         if let Ok(win) = self.get_active_window(&conn) {
             self.handle_window_change(&conn, win)?;
         }
@@ -426,12 +654,15 @@ impl AppConfig {
     fn load_from_file(path: &PathBuf) -> Result<Self> {
         if path.exists() {
             let content = fs::read_to_string(path)?;
-            Ok(serde_json::from_str(&content)?)
+            serde_json::from_str(&content).context("Failed to parse config file")
         } else {
             warn!("Creating new config file");
             let config = AppConfig {
                 window_layout_map: HashMap::new(),
-                hotkeys: HashMap::from([("add_window".into(), "ctrl shift q".into())]),
+                hotkeys: [("add_window".to_string(), "ctrl shift q".to_string())]
+                    .iter()
+                    .cloned()
+                    .collect(),
             };
             config.save_to_file(path)?;
             Ok(config)
