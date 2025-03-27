@@ -268,20 +268,42 @@ impl NSKeyboardLayoutSwitcher {
     }
 
     fn add_current_window(&self) -> Result<()> {
+        // Получаем класс активного окна
         let window_class = self
             .get_active_window_class()
-            .context("Failed to detect window class")?;
+            .context("Не удалось определить класс окна")?;
+
+        // Получаем текущую раскладку
         let layout = self
             .get_current_layout()
-            .context("Failed to detect current layout")?;
+            .context("Не удалось определить текущую раскладку")?;
 
-        let mut config = self.config.lock().unwrap();
+        info!(
+            "Добавляем правило: окно '{}' → раскладка {}",
+            window_class, layout
+        );
+
+        // Блокируем доступ к конфигу
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|e| anyhow!("Ошибка блокировки конфига: {}", e))?;
+
+        // Добавляем правило
         config
             .window_layout_map
             .insert(window_class.clone(), layout);
-        config.save_to_file(&self.config_path)?;
 
-        info!("Added mapping: {} => {}", window_class, layout);
+        // Сохраняем конфиг
+        config
+            .save_to_file(&self.config_path)
+            .context("Ошибка сохранения конфига")?;
+
+        info!(
+            "Успешно добавлено! Текущие правила: {}",
+            serde_json::to_string_pretty(&*config).unwrap_or_default()
+        );
+
         Ok(())
     }
 
