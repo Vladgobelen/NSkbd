@@ -424,29 +424,16 @@ impl KeyboardLayoutSwitcher {
         if let Some(window_class) = self.get_window_class(window_id) {
             info!("Window class focused: '{}'", window_class);
 
-            let current_layout = self.get_current_layout();
-            info!("Current layout before switch: {:?}", current_layout);
-
             let config = self
                 .config
                 .lock()
                 .map_err(|e| anyhow!("Config lock error: {}", e))?;
 
             if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
-                info!("Configured layout for this window: {}", target_layout);
-
-                if let Some(current) = current_layout {
-                    if current != target_layout {
-                        info!("Switching layout from {} to {}", current, target_layout);
-                        self.switch_layout(target_layout)?;
-                    } else {
-                        debug!("Layout already matches ({}), no action needed", current);
-                    }
-                } else {
-                    warn!("Couldn't determine current layout, can't switch");
-                }
+                info!("Forcing layout switch to: {}", target_layout);
+                self.switch_layout(target_layout)?;
             } else {
-                debug!("No layout mapping found for this window");
+                debug!("No layout mapping found for this window, keeping current layout");
             }
         } else {
             warn!("Couldn't determine window class for window {}", window_id);
