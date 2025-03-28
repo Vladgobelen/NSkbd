@@ -299,25 +299,7 @@ impl KeyboardLayoutSwitcher {
         self.xkb
             .set_layout(layout)
             .context("Failed to switch layout")?;
-
-        // Verify the switch was successful
-        match self.xkb.current_layout() {
-            Ok(new_layout) if new_layout == layout => {
-                info!("Successfully switched to layout {}", layout);
-                Ok(())
-            }
-            Ok(new_layout) => {
-                warn!(
-                    "Switch failed! Current layout is {} (expected {})",
-                    new_layout, layout
-                );
-                Err(anyhow!("Layout switch verification failed"))
-            }
-            Err(e) => {
-                error!("Failed to verify layout switch: {}", e);
-                Err(anyhow!("Layout verification error"))
-            }
-        }
+        Ok(())
     }
 
     fn start_keyboard_listener(&self) -> Result<()> {
@@ -431,7 +413,9 @@ impl KeyboardLayoutSwitcher {
 
             if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
                 info!("Forcing layout switch to: {}", target_layout);
-                self.switch_layout(target_layout)?;
+                if let Err(e) = self.switch_layout(target_layout) {
+                    error!("Failed to switch layout: {}", e);
+                }
             } else {
                 debug!("No layout mapping found for this window, keeping current layout");
             }
@@ -536,35 +520,48 @@ impl XKeyboard {
     fn set_layout(&self, group_num: u8) -> Result<()> {
         info!("Setting keyboard layout to group {}", group_num);
 
-        self.conn
-            .xkb_latch_lock_state(
-                self.device_id,
-                ModMask::from(0u8),
-                ModMask::from(0u8),
-                true,
-                Group::from(group_num),
-                ModMask::from(0u8),
-                false,
-                0,
-            )
-            .context("Failed to set XKB layout")?;
+        // Делаем несколько попыток переключения
+        for attempt in 1..=3 {
+            self.conn
+                .xkb_latch_lock_state(
+                    self.device_id,
+                    ModMask::from(0u8),
+                    ModMask::from(0u8),
+                    true,
+                    Group::from(group_num),
+                    ModMask::from(0u8),
+                    false,
+                    0,
+                )
+                .context("Failed to set XKB layout")?;
 
-        self.conn
-            .flush()
-            .context("Failed to flush X11 connection")?;
+            self.conn
+                .flush()
+                .context("Failed to flush X11 connection")?;
 
-        // Verify the layout was actually changed
-        let new_layout = self.current_layout()?;
-        if new_layout != group_num {
-            warn!(
-                "Layout switch verification failed! Expected {}, got {}",
-                group_num, new_layout
-            );
-            Err(anyhow!("Layout switch verification failed"))
-        } else {
-            info!("Keyboard layout successfully set to {}", group_num);
-            Ok(())
+            // Даем системе время на переключение
+            thread::sleep(Duration::from_millis(50));
+
+            // Проверяем текущую раскладку
+            match self.current_layout() {
+                Ok(new_layout) if new_layout == group_num => {
+                    info!("Successfully switched to layout {}", group_num);
+                    return Ok(());
+                }
+                Ok(new_layout) => {
+                    warn!(
+                        "Attempt {}: layout is {} (expected {})",
+                        attempt, new_layout, group_num
+                    );
+                }
+                Err(e) => {
+                    warn!("Attempt {}: failed to verify layout: {}", attempt, e);
+                }
+            }
         }
+
+        warn!("Failed to switch layout after 3 attempts");
+        Err(anyhow!("Layout switch failed after multiple attempts"))
     }
 }
 
