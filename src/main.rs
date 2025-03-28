@@ -429,6 +429,7 @@ impl KeyboardLayoutSwitcher {
         )?;
         self.conn.flush()?;
 
+        // Первоначальная проверка активного окна
         if let Some(win) = self.get_active_window() {
             self.handle_window_change(win)?;
         }
@@ -444,7 +445,11 @@ impl KeyboardLayoutSwitcher {
                         }
                     }
                 }
-                Err(e) => error!("X11 event error: {}", e),
+                Err(e) => {
+                    error!("X11 event error: {}", e);
+                    // Добавим небольшую паузу при ошибках
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }
@@ -472,15 +477,20 @@ struct XKeyboard {
 
 impl XKeyboard {
     fn new(conn: Arc<RustConnection>) -> Result<Self> {
-        conn.xkb_use_extension(1, 0)
+        let reply = conn
+            .xkb_use_extension(1, 0)
             .context("Failed to initialize XKB extension")?
             .reply()
             .context("Failed to get XKB extension reply")?;
 
-        Ok(Self {
-            conn,
-            device_id: ID::USE_CORE_KBD.into(),
-        })
+        if !reply.supported {
+            return Err(anyhow!("XKB extension not supported"));
+        }
+
+        // Используем core keyboard device
+        let device_id = ID::USE_CORE_KBD.into();
+
+        Ok(Self { conn, device_id })
     }
 
     fn current_layout(&self) -> Result<u8> {
@@ -490,28 +500,43 @@ impl XKeyboard {
             .context("Failed to get XKB state")?
             .reply()
             .context("Failed to get XKB state reply")?;
-        Ok(state.group.into())
+        Ok(u8::from(state.group))
     }
 
     fn set_layout(&self, group_num: u8) -> Result<()> {
-        let affect_mod_locks = ModMask::from(0u8);
-        let mod_locks = ModMask::from(0u8);
-        let group_lock = Group::from(group_num);
-        let affect_mod_latches = ModMask::from(0u8);
-        let group_latch = 0u16;
+        // Получаем текущее состояние
+        let state = self
+            .conn
+            .xkb_get_state(self.device_id)
+            .context("Failed to get XKB state for set_layout")?
+            .reply()
+            .context("Failed to get XKB state reply for set_layout")?;
 
+        // Если уже в нужной раскладке - ничего не делаем
+        if u8::from(state.group) == group_num {
+            return Ok(());
+        }
+
+        // Устанавливаем новую раскладку
         self.conn
             .xkb_latch_lock_state(
                 self.device_id,
-                affect_mod_locks,
-                mod_locks,
-                true,
-                group_lock,
-                affect_mod_latches,
-                false,
-                group_latch,
+                ModMask::default(),     // Не меняем модификаторы
+                ModMask::default(),     // Не блокируем модификаторы
+                true,                   // Изменяем группу
+                Group::from(group_num), // Новая группа
+                ModMask::default(),     // Не меняем временные модификаторы
+                false,                  // Не меняем временную группу
+                0,                      // Нет временной группы
             )
             .context("Failed to set XKB layout")?;
+
+        // Принудительно синхронизируем
+        self.conn
+            .flush()
+            .context("Failed to flush X11 connection")?;
+
+        info!("Layout switched to {}", group_num);
         Ok(())
     }
 }
