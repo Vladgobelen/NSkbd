@@ -12,7 +12,6 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime},
 };
 use x11rb::{
     connection::Connection,
@@ -90,15 +89,15 @@ impl KeyboardLayoutSwitcher {
         let config = AppConfig::load_from_file(&config_path)?;
 
         let (conn, screen_num) = x11rb::connect(None).context("Failed to connect to X11 server")?;
-        let conn_arc = Arc::new(conn);
-        let xkb = XKeyboard::new(Arc::clone(&conn_arc))?;
+        let conn = Arc::new(conn);
+        let xkb = XKeyboard::new(Arc::clone(&conn))?;
 
         Ok(Self {
             config_path,
             log_path,
             config: Arc::new(Mutex::new(config)),
             last_window_id: None,
-            conn: conn_arc,
+            conn,
             screen_num,
             xkb,
         })
@@ -169,6 +168,17 @@ impl KeyboardLayoutSwitcher {
             "down" => Some(Key::DownArrow),
             "left" => Some(Key::LeftArrow),
             "right" => Some(Key::RightArrow),
+            "comma" => Some(Key::Comma),
+            "period" => Some(Key::Dot),
+            "slash" => Some(Key::Slash),
+            "semicolon" => Some(Key::SemiColon),
+            "apostrophe" => Some(Key::Quote),
+            "bracketleft" => Some(Key::LeftBracket),
+            "bracketright" => Some(Key::RightBracket),
+            "backslash" => Some(Key::BackSlash),
+            "minus" => Some(Key::Minus),
+            "equal" => Some(Key::Equal),
+            "grave" => Some(Key::BackQuote),
             _ => None,
         }
     }
@@ -222,22 +232,10 @@ impl KeyboardLayoutSwitcher {
             .reply()
             .ok()?;
 
-        if reply.format != 8 || reply.value.is_empty() {
-            error!(
-                "Empty or invalid WM_CLASS property for window {}",
-                window_id
-            );
-            return None;
-        }
-
         let value = String::from_utf8_lossy(&reply.value);
         let parts: Vec<&str> = value.split('\0').collect();
 
         if parts.len() < 2 {
-            error!(
-                "Invalid WM_CLASS format for window {}: {:?}",
-                window_id, value
-            );
             return None;
         }
 
@@ -248,36 +246,27 @@ impl KeyboardLayoutSwitcher {
         };
 
         if class.is_empty() {
-            error!("Empty window class for window {}", window_id);
             return None;
         }
 
-        info!("Window class for {}: '{}'", window_id, class);
         Some(class.to_lowercase())
     }
 
-    fn get_current_layout(&self) -> Option<u8> {
-        self.xkb.current_layout().ok()
+    fn get_current_layout(&self) -> Result<u8> {
+        self.xkb.current_layout()
     }
 
     fn add_current_window(&self) -> Result<()> {
-        let window_id = self
-            .get_active_window()
-            .context("Failed to get window ID")?;
-
+        let window_id = self.get_active_window().context("No active window")?;
         let window_class = self
             .get_window_class(window_id)
             .context("Failed to detect window class")?;
-
-        let layout = self
-            .get_current_layout()
-            .context("Failed to detect current layout")?;
+        let layout = self.get_current_layout()?;
 
         let mut config = self
             .config
             .lock()
             .map_err(|e| anyhow!("Config lock error: {}", e))?;
-
         config
             .window_layout_map
             .insert(window_class.clone(), layout);
@@ -302,37 +291,16 @@ impl KeyboardLayoutSwitcher {
         thread::spawn(move || {
             let mut pressed_keys = HashSet::new();
             let mut modifiers = ModifierState::default();
-            let mut last_hotkey = SystemTime::now();
 
             let callback = move |event: KbdEvent| match event.event_type {
                 EventType::KeyPress(key) => {
                     pressed_keys.insert(key.clone());
                     modifiers.update(&key, true);
 
-                    let hotkey = {
-                        let config = match config.lock() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!("Config lock error: {}", e);
-                                return;
-                            }
-                        };
-                        config.hotkeys.get("add_window").cloned()
-                    };
-
-                    if let Some(hotkey) = hotkey {
-                        if Self::check_hotkey(&pressed_keys, &modifiers, &hotkey) {
-                            let now = SystemTime::now();
-                            if let Ok(duration) = now.duration_since(last_hotkey) {
-                                if duration > Duration::from_secs(1) {
-                                    last_hotkey = now;
-                                    let switcher_clone = switcher.clone();
-                                    thread::spawn(move || {
-                                        if let Err(e) = switcher_clone.add_current_window() {
-                                            error!("Failed to add window: {}", e);
-                                        }
-                                    });
-                                }
+                    if let Ok(config) = config.lock() {
+                        if let Some(hotkey) = config.hotkeys.get("add_window") {
+                            if Self::check_hotkey(&pressed_keys, &modifiers, hotkey) {
+                                let _ = switcher.clone().add_current_window();
                             }
                         }
                     }
@@ -395,17 +363,16 @@ impl KeyboardLayoutSwitcher {
         self.last_window_id = Some(window_id);
 
         if let Some(window_class) = self.get_window_class(window_id) {
+            info!("Window class: {}", window_class);
+
             let config = self
                 .config
                 .lock()
                 .map_err(|e| anyhow!("Config lock error: {}", e))?;
 
             if let Some(target_layout) = config.window_layout_map.get(&window_class) {
-                if let Some(current_layout) = self.get_current_layout() {
-                    if current_layout != *target_layout {
-                        self.switch_layout(*target_layout)?;
-                    }
-                }
+                info!("Switching to layout: {}", target_layout);
+                self.switch_layout(*target_layout)?;
             }
         }
 
@@ -413,7 +380,7 @@ impl KeyboardLayoutSwitcher {
     }
 
     fn run(&mut self) -> Result<()> {
-        info!("Starting keyboard layout switcher (X11 event-based)");
+        info!("Starting keyboard layout switcher");
         self.start_keyboard_listener()?;
 
         let screen = &self.conn.setup().roots[self.screen_num];
@@ -429,7 +396,6 @@ impl KeyboardLayoutSwitcher {
         )?;
         self.conn.flush()?;
 
-        // Первоначальная проверка активного окна
         if let Some(win) = self.get_active_window() {
             self.handle_window_change(win)?;
         }
@@ -445,11 +411,7 @@ impl KeyboardLayoutSwitcher {
                         }
                     }
                 }
-                Err(e) => {
-                    error!("X11 event error: {}", e);
-                    // Добавим небольшую паузу при ошибках
-                    thread::sleep(Duration::from_millis(100));
-                }
+                Err(e) => error!("X11 event error: {}", e),
             }
         }
     }
@@ -477,20 +439,15 @@ struct XKeyboard {
 
 impl XKeyboard {
     fn new(conn: Arc<RustConnection>) -> Result<Self> {
-        let reply = conn
-            .xkb_use_extension(1, 0)
+        conn.xkb_use_extension(1, 0)
             .context("Failed to initialize XKB extension")?
             .reply()
             .context("Failed to get XKB extension reply")?;
 
-        if !reply.supported {
-            return Err(anyhow!("XKB extension not supported"));
-        }
-
-        // Используем core keyboard device
-        let device_id = ID::USE_CORE_KBD.into();
-
-        Ok(Self { conn, device_id })
+        Ok(Self {
+            conn,
+            device_id: ID::USE_CORE_KBD.into(),
+        })
     }
 
     fn current_layout(&self) -> Result<u8> {
@@ -504,39 +461,19 @@ impl XKeyboard {
     }
 
     fn set_layout(&self, group_num: u8) -> Result<()> {
-        // Получаем текущее состояние
-        let state = self
-            .conn
-            .xkb_get_state(self.device_id)
-            .context("Failed to get XKB state for set_layout")?
-            .reply()
-            .context("Failed to get XKB state reply for set_layout")?;
-
-        // Если уже в нужной раскладке - ничего не делаем
-        if u8::from(state.group) == group_num {
-            return Ok(());
-        }
-
-        // Устанавливаем новую раскладку
         self.conn
             .xkb_latch_lock_state(
                 self.device_id,
-                ModMask::default(),     // Не меняем модификаторы
-                ModMask::default(),     // Не блокируем модификаторы
-                true,                   // Изменяем группу
-                Group::from(group_num), // Новая группа
-                ModMask::default(),     // Не меняем временные модификаторы
-                false,                  // Не меняем временную группу
-                0,                      // Нет временной группы
+                ModMask::default(),
+                ModMask::default(),
+                true,
+                Group::from(group_num),
+                ModMask::default(),
+                false,
+                0,
             )
             .context("Failed to set XKB layout")?;
-
-        // Принудительно синхронизируем
-        self.conn
-            .flush()
-            .context("Failed to flush X11 connection")?;
-
-        info!("Layout switched to {}", group_num);
+        self.conn.flush()?;
         Ok(())
     }
 }
