@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use log::{debug, error, info, warn};
+use log::error;
 use rdev::{listen, Event as KbdEvent, EventType, Key};
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
@@ -79,17 +79,14 @@ impl KeyboardLayoutSwitcher {
         let log_file = File::create(&log_path)
             .context(format!("Failed to create log file: {}", log_path.display()))?;
 
-        WriteLogger::init(LevelFilter::Debug, LogConfig::default(), log_file)
+        WriteLogger::init(LevelFilter::Error, LogConfig::default(), log_file)
             .context("Failed to initialize logger")?;
 
-        info!("Initializing keyboard switcher");
         let config = AppConfig::load_from_file(&config_path)?;
 
         let (conn, screen_num) = x11rb::connect(None).context("Failed to connect to X11 server")?;
         let conn = Arc::new(conn);
         let xkb = XKeyboard::new(Arc::clone(&conn))?;
-
-        info!("Current keyboard layout: {}", xkb.current_layout()?);
 
         Ok(Self {
             config_path,
@@ -221,10 +218,7 @@ impl KeyboardLayoutSwitcher {
             .ok()?;
 
         if reply.format != 8 || reply.value.is_empty() {
-            error!(
-                "Empty or invalid WM_CLASS property for window {}",
-                window_id
-            );
+            error!("WM_CLASS property error for window {}", window_id);
             return None;
         }
 
@@ -232,10 +226,7 @@ impl KeyboardLayoutSwitcher {
         let parts: Vec<&str> = value.split('\0').collect();
 
         if parts.len() < 2 {
-            error!(
-                "Invalid WM_CLASS format for window {}: {:?}",
-                window_id, value
-            );
+            error!("WM_CLASS format error for window {}", window_id);
             return None;
         }
 
@@ -250,21 +241,17 @@ impl KeyboardLayoutSwitcher {
             return None;
         }
 
-        debug!("Window class for {}: '{}'", window_id, class);
         Some(class.to_lowercase())
     }
 
     fn get_current_layout(&self) -> Option<u8> {
-        match self.xkb.current_layout() {
-            Ok(layout) => {
-                debug!("Current layout detected: {}", layout);
-                Some(layout)
-            }
-            Err(e) => {
+        self.xkb
+            .current_layout()
+            .map_err(|e| {
                 error!("Failed to get current layout: {}", e);
-                None
-            }
-        }
+                e
+            })
+            .ok()
     }
 
     fn add_current_window(&self) -> Result<()> {
@@ -290,16 +277,13 @@ impl KeyboardLayoutSwitcher {
             .insert(window_class.clone(), layout);
         config.save_to_file(&self.config_path)?;
 
-        info!("Added mapping: {} => {}", window_class, layout);
         Ok(())
     }
 
     fn switch_layout(&self, layout: u8) -> Result<()> {
-        info!("Attempting to switch to layout {}", layout);
         self.xkb
             .set_layout(layout)
-            .context("Failed to switch layout")?;
-        Ok(())
+            .context("Failed to switch layout")
     }
 
     fn start_keyboard_listener(&self) -> Result<()> {
@@ -396,38 +380,28 @@ impl KeyboardLayoutSwitcher {
 
     fn handle_window_change(&mut self, window_id: u32) -> Result<()> {
         if self.last_window_id == Some(window_id) {
-            debug!("Same window focused again ({}), ignoring", window_id);
             return Ok(());
         }
 
         self.last_window_id = Some(window_id);
-        debug!("New window focused: {}", window_id);
 
         if let Some(window_class) = self.get_window_class(window_id) {
-            info!("Window class focused: '{}'", window_class);
-
             let config = self
                 .config
                 .lock()
                 .map_err(|e| anyhow!("Config lock error: {}", e))?;
 
             if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
-                info!("Forcing layout switch to: {}", target_layout);
                 if let Err(e) = self.switch_layout(target_layout) {
                     error!("Failed to switch layout: {}", e);
                 }
-            } else {
-                debug!("No layout mapping found for this window, keeping current layout");
             }
-        } else {
-            warn!("Couldn't determine window class for window {}", window_id);
         }
 
         Ok(())
     }
 
     fn run(&mut self) -> Result<()> {
-        info!("Starting keyboard layout switcher");
         self.start_keyboard_listener()?;
 
         let screen = &self.conn.setup().roots[self.screen_num];
@@ -443,12 +417,10 @@ impl KeyboardLayoutSwitcher {
         )?;
         self.conn.flush()?;
 
-        // Initial window check
         if let Some(win) = self.get_active_window() {
             self.handle_window_change(win)?;
         }
 
-        info!("Entering main event loop");
         loop {
             match self.conn.wait_for_event() {
                 Ok(event) => {
@@ -491,7 +463,6 @@ struct XKeyboard {
 
 impl XKeyboard {
     fn new(conn: Arc<RustConnection>) -> Result<Self> {
-        info!("Initializing XKeyboard extension");
         conn.xkb_use_extension(1, 0)
             .context("Failed to initialize XKB extension")?
             .reply()
@@ -504,24 +475,17 @@ impl XKeyboard {
     }
 
     fn current_layout(&self) -> Result<u8> {
-        debug!("Getting current keyboard layout");
         let state = self
             .conn
             .xkb_get_state(self.device_id)
             .context("Failed to get XKB state")?
             .reply()
             .context("Failed to get XKB state reply")?;
-
-        let layout = state.group.into();
-        debug!("Current layout group: {}", layout);
-        Ok(layout)
+        Ok(state.group.into())
     }
 
     fn set_layout(&self, group_num: u8) -> Result<()> {
-        info!("Setting keyboard layout to group {}", group_num);
-
-        // Делаем несколько попыток переключения
-        for attempt in 1..=3 {
+        for _ in 1..=3 {
             self.conn
                 .xkb_latch_lock_state(
                     self.device_id,
@@ -538,41 +502,24 @@ impl XKeyboard {
             self.conn
                 .flush()
                 .context("Failed to flush X11 connection")?;
-
-            // Даем системе время на переключение
             thread::sleep(Duration::from_millis(50));
 
-            // Проверяем текущую раскладку
             match self.current_layout() {
-                Ok(new_layout) if new_layout == group_num => {
-                    info!("Successfully switched to layout {}", group_num);
-                    return Ok(());
-                }
-                Ok(new_layout) => {
-                    warn!(
-                        "Attempt {}: layout is {} (expected {})",
-                        attempt, new_layout, group_num
-                    );
-                }
-                Err(e) => {
-                    warn!("Attempt {}: failed to verify layout: {}", attempt, e);
-                }
+                Ok(new_layout) if new_layout == group_num => return Ok(()),
+                _ => continue,
             }
         }
 
-        warn!("Failed to switch layout after 3 attempts");
         Err(anyhow!("Layout switch failed after multiple attempts"))
     }
 }
 
 impl AppConfig {
     fn load_from_file(path: &PathBuf) -> Result<Self> {
-        info!("Loading config from {}", path.display());
         if path.exists() {
             let content = fs::read_to_string(path)?;
             Ok(serde_json::from_str(&content)?)
         } else {
-            warn!("Config file not found, creating new one");
             let config = AppConfig {
                 window_layout_map: HashMap::new(),
                 hotkeys: HashMap::from([("add_window".into(), "ctrl shift q".into())]),
@@ -583,7 +530,6 @@ impl AppConfig {
     }
 
     fn save_to_file(&self, path: &PathBuf) -> Result<()> {
-        info!("Saving config to {}", path.display());
         let content = serde_json::to_string_pretty(self)?;
         let mut file = File::create(path)?;
         file.write_all(content.as_bytes())?;
@@ -596,11 +542,8 @@ fn main() -> Result<()> {
     let mut switcher = KeyboardLayoutSwitcher::new("config.json", "kbd_switcher.log")?;
 
     if env::args().any(|arg| arg == "--add") {
-        info!("Running in add window mode");
         switcher.add_current_window()?;
-        println!("Current window added to config");
     } else {
-        info!("Running in daemon mode");
         switcher.run()?;
     }
 
