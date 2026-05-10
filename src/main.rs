@@ -209,7 +209,7 @@ impl KeyboardLayoutSwitcher {
 
     fn type_text(&self, text: &str) -> Result<()> {
         let output = Command::new("xdotool")
-            .args(["type", "--delay", "0", text])
+            .args(["type", "--delay", "5", text])
             .output()
             .context("Failed to type text")?;
         if !output.status.success() { return Err(anyhow!("xdotool type failed")); }
