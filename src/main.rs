@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
+use evdev::{uinput::VirtualDeviceBuilder, AttributeSet, EventType, InputEvent, Key};
 use log::{error, info};
-use rdev::{listen, Event as KbdEvent, EventType, Key};
+use rdev::{listen, Event as KbdEvent, EventType as RdevEventType};
+use rdev::Key as RdevKey;
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
 use std::{
@@ -24,6 +26,8 @@ use x11rb::{
     rust_connection::RustConnection,
 };
 
+const MAX_CHARS: usize = 500;
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Clone)]
 struct AppConfig {
     window_layout_map: HashMap<String, u8>,
@@ -39,12 +43,12 @@ struct ModifierState {
 }
 
 impl ModifierState {
-    fn update(&mut self, key: &Key, is_press: bool) {
+    fn update(&mut self, key: &RdevKey, is_press: bool) {
         match key {
-            Key::ShiftLeft | Key::ShiftRight => self.shift = is_press,
-            Key::ControlLeft | Key::ControlRight => self.ctrl = is_press,
-            Key::Alt | Key::AltGr => self.alt = is_press,
-            Key::MetaLeft | Key::MetaRight => self.meta = is_press,
+            RdevKey::ShiftLeft | RdevKey::ShiftRight => self.shift = is_press,
+            RdevKey::ControlLeft | RdevKey::ControlRight => self.ctrl = is_press,
+            RdevKey::Alt | RdevKey::AltGr => self.alt = is_press,
+            RdevKey::MetaLeft | RdevKey::MetaRight => self.meta = is_press,
             _ => {}
         }
     }
@@ -70,6 +74,9 @@ struct KeyboardLayoutSwitcher {
     caps_space_triggered: Arc<Mutex<bool>>,
     shift_count: Arc<Mutex<u32>>,
     last_shift_time: Arc<Mutex<Instant>>,
+    char_buffer: Arc<Mutex<String>>,
+    buffer_window_id: Arc<Mutex<Option<u32>>>, 
+    uinput: Arc<Mutex<evdev::uinput::VirtualDevice>>,
 }
 
 impl KeyboardLayoutSwitcher {
@@ -96,6 +103,8 @@ impl KeyboardLayoutSwitcher {
         let conn = Arc::new(conn);
         let xkb = XKeyboard::new(Arc::clone(&conn))?;
 
+        let uinput = create_virtual_keyboard()?;
+
         Ok(Self {
             config_path,
             log_path,
@@ -109,41 +118,71 @@ impl KeyboardLayoutSwitcher {
             caps_space_triggered: Arc::new(Mutex::new(false)),
             shift_count: Arc::new(Mutex::new(0)),
             last_shift_time: Arc::new(Mutex::new(Instant::now())),
+            char_buffer: Arc::new(Mutex::new(String::with_capacity(MAX_CHARS + 100))),
+            buffer_window_id: Arc::new(Mutex::new(None)),
+            uinput: Arc::new(Mutex::new(uinput)),
         })
     }
 
-    fn str_to_key(key_str: &str) -> Option<Key> {
+    fn str_to_key(key_str: &str) -> Option<RdevKey> {
         match key_str.to_lowercase().as_str() {
-            "a" => Some(Key::KeyA), "b" => Some(Key::KeyB), "c" => Some(Key::KeyC),
-            "d" => Some(Key::KeyD), "e" => Some(Key::KeyE), "f" => Some(Key::KeyF),
-            "g" => Some(Key::KeyG), "h" => Some(Key::KeyH), "i" => Some(Key::KeyI),
-            "j" => Some(Key::KeyJ), "k" => Some(Key::KeyK), "l" => Some(Key::KeyL),
-            "m" => Some(Key::KeyM), "n" => Some(Key::KeyN), "o" => Some(Key::KeyO),
-            "p" => Some(Key::KeyP), "q" => Some(Key::KeyQ), "r" => Some(Key::KeyR),
-            "s" => Some(Key::KeyS), "t" => Some(Key::KeyT), "u" => Some(Key::KeyU),
-            "v" => Some(Key::KeyV), "w" => Some(Key::KeyW), "x" => Some(Key::KeyX),
-            "y" => Some(Key::KeyY), "z" => Some(Key::KeyZ),
-            "0" => Some(Key::Num0), "1" => Some(Key::Num1), "2" => Some(Key::Num2),
-            "3" => Some(Key::Num3), "4" => Some(Key::Num4), "5" => Some(Key::Num5),
-            "6" => Some(Key::Num6), "7" => Some(Key::Num7), "8" => Some(Key::Num8),
-            "9" => Some(Key::Num9),
-            "f1" => Some(Key::F1), "f2" => Some(Key::F2), "f3" => Some(Key::F3),
-            "f4" => Some(Key::F4), "f5" => Some(Key::F5), "f6" => Some(Key::F6),
-            "f7" => Some(Key::F7), "f8" => Some(Key::F8), "f9" => Some(Key::F9),
-            "f10" => Some(Key::F10), "f11" => Some(Key::F11), "f12" => Some(Key::F12),
-            "space" => Some(Key::Space), "enter" => Some(Key::Return),
-            "tab" => Some(Key::Tab), "backspace" => Some(Key::Backspace),
-            "escape" => Some(Key::Escape), "insert" => Some(Key::Insert),
-            "delete" => Some(Key::Delete), "home" => Some(Key::Home),
-            "end" => Some(Key::End), "pageup" => Some(Key::PageUp),
-            "pagedown" => Some(Key::PageDown), "up" => Some(Key::UpArrow),
-            "down" => Some(Key::DownArrow), "left" => Some(Key::LeftArrow),
-            "right" => Some(Key::RightArrow),
+            "a" => Some(RdevKey::KeyA), "b" => Some(RdevKey::KeyB), "c" => Some(RdevKey::KeyC),
+            "d" => Some(RdevKey::KeyD), "e" => Some(RdevKey::KeyE), "f" => Some(RdevKey::KeyF),
+            "g" => Some(RdevKey::KeyG), "h" => Some(RdevKey::KeyH), "i" => Some(RdevKey::KeyI),
+            "j" => Some(RdevKey::KeyJ), "k" => Some(RdevKey::KeyK), "l" => Some(RdevKey::KeyL),
+            "m" => Some(RdevKey::KeyM), "n" => Some(RdevKey::KeyN), "o" => Some(RdevKey::KeyO),
+            "p" => Some(RdevKey::KeyP), "q" => Some(RdevKey::KeyQ), "r" => Some(RdevKey::KeyR),
+            "s" => Some(RdevKey::KeyS), "t" => Some(RdevKey::KeyT), "u" => Some(RdevKey::KeyU),
+            "v" => Some(RdevKey::KeyV), "w" => Some(RdevKey::KeyW), "x" => Some(RdevKey::KeyX),
+            "y" => Some(RdevKey::KeyY), "z" => Some(RdevKey::KeyZ),
+            "0" => Some(RdevKey::Num0), "1" => Some(RdevKey::Num1), "2" => Some(RdevKey::Num2),
+            "3" => Some(RdevKey::Num3), "4" => Some(RdevKey::Num4), "5" => Some(RdevKey::Num5),
+            "6" => Some(RdevKey::Num6), "7" => Some(RdevKey::Num7), "8" => Some(RdevKey::Num8),
+            "9" => Some(RdevKey::Num9),
+            "f1" => Some(RdevKey::F1), "f2" => Some(RdevKey::F2), "f3" => Some(RdevKey::F3),
+            "f4" => Some(RdevKey::F4), "f5" => Some(RdevKey::F5), "f6" => Some(RdevKey::F6),
+            "f7" => Some(RdevKey::F7), "f8" => Some(RdevKey::F8), "f9" => Some(RdevKey::F9),
+            "f10" => Some(RdevKey::F10), "f11" => Some(RdevKey::F11), "f12" => Some(RdevKey::F12),
+            "space" => Some(RdevKey::Space), "enter" => Some(RdevKey::Return),
+            "tab" => Some(RdevKey::Tab), "backspace" => Some(RdevKey::Backspace),
+            "escape" => Some(RdevKey::Escape), "insert" => Some(RdevKey::Insert),
+            "delete" => Some(RdevKey::Delete), "home" => Some(RdevKey::Home),
+            "end" => Some(RdevKey::End), "pageup" => Some(RdevKey::PageUp),
+            "pagedown" => Some(RdevKey::PageDown), "up" => Some(RdevKey::UpArrow),
+            "down" => Some(RdevKey::DownArrow), "left" => Some(RdevKey::LeftArrow),
+            "right" => Some(RdevKey::RightArrow),
             _ => None,
         }
     }
 
-    fn check_hotkey(pressed_keys: &HashSet<Key>, modifiers: &ModifierState, hotkey_str: &str) -> bool {
+    fn is_typing_key(key: &RdevKey) -> bool {
+        matches!(key,
+            RdevKey::KeyA | RdevKey::KeyB | RdevKey::KeyC | RdevKey::KeyD | RdevKey::KeyE |
+            RdevKey::KeyF | RdevKey::KeyG | RdevKey::KeyH | RdevKey::KeyI | RdevKey::KeyJ |
+            RdevKey::KeyK | RdevKey::KeyL | RdevKey::KeyM | RdevKey::KeyN | RdevKey::KeyO |
+            RdevKey::KeyP | RdevKey::KeyQ | RdevKey::KeyR | RdevKey::KeyS | RdevKey::KeyT |
+            RdevKey::KeyU | RdevKey::KeyV | RdevKey::KeyW | RdevKey::KeyX | RdevKey::KeyY |
+            RdevKey::KeyZ |
+            RdevKey::Num0 | RdevKey::Num1 | RdevKey::Num2 | RdevKey::Num3 | RdevKey::Num4 |
+            RdevKey::Num5 | RdevKey::Num6 | RdevKey::Num7 | RdevKey::Num8 | RdevKey::Num9 |
+            RdevKey::Minus | RdevKey::Equal |
+            RdevKey::LeftBracket | RdevKey::RightBracket |
+            RdevKey::SemiColon | RdevKey::Quote |
+            RdevKey::Comma | RdevKey::Dot | RdevKey::Slash |
+            RdevKey::BackSlash
+        )
+    }
+
+    fn is_boundary(key: &RdevKey) -> bool {
+        matches!(key,
+            RdevKey::Return | RdevKey::Tab | RdevKey::Escape |
+            RdevKey::UpArrow | RdevKey::DownArrow | RdevKey::LeftArrow | RdevKey::RightArrow |
+            RdevKey::Home | RdevKey::End | RdevKey::PageUp | RdevKey::PageDown |
+            RdevKey::Delete
+        )
+    }
+
+    fn check_hotkey(pressed_keys: &HashSet<RdevKey>, modifiers: &ModifierState, hotkey_str: &str) -> bool {
         let parts: Vec<&str> = hotkey_str.split_whitespace().collect();
         let mut required_mods = HashSet::new();
         let mut required_key = None;
@@ -199,23 +238,6 @@ impl KeyboardLayoutSwitcher {
         self.xkb.set_layout(layout)
     }
 
-    fn get_primary_selection(&self) -> String {
-        Command::new("xclip")
-            .args(["-selection", "primary", "-o"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default()
-    }
-
-    fn type_text(&self, text: &str) -> Result<()> {
-        let output = Command::new("xdotool")
-            .args(["type", "--delay", "5", text])
-            .output()
-            .context("Failed to type text")?;
-        if !output.status.success() { return Err(anyhow!("xdotool type failed")); }
-        Ok(())
-    }
-
     fn simulate_key(&self, keys: &[&str]) -> Result<()> {
         let key_sequence = keys.join("+");
         let output = Command::new("xdotool")
@@ -224,6 +246,32 @@ impl KeyboardLayoutSwitcher {
             .context("Failed to simulate key")?;
         if !output.status.success() { return Err(anyhow!("xdotool failed")); }
         Ok(())
+    }
+
+    fn type_text_uinput(&self, text: &str, layout: u8) -> Result<()> {
+        let layout_is_ru = layout == 1;
+        let mut dev = self.uinput.lock().unwrap();
+        for ch in text.chars() {
+            if let Some((code, shift)) = char_to_keycode(ch, layout_is_ru) {
+                if shift {
+                    dev.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 1)])?;
+                }
+                dev.emit(&[InputEvent::new(EventType::KEY, code, 1)])?;
+                dev.emit(&[InputEvent::new(EventType::KEY, code, 0)])?;
+                if shift {
+                    dev.emit(&[InputEvent::new(EventType::KEY, Key::KEY_LEFTSHIFT.code(), 0)])?;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        Ok(())
+    }
+
+    fn take_last_n_words(buf: &str, n: usize) -> String {
+        let words: Vec<&str> = buf.split_whitespace().collect();
+        if words.is_empty() || n == 0 { return String::new(); }
+        let start = words.len().saturating_sub(n);
+        words[start..].join(" ")
     }
 
     fn convert_layout(&self, text: &str) -> String {
@@ -240,23 +288,53 @@ impl KeyboardLayoutSwitcher {
             ('P', 'З'), ('Q', 'Й'), ('R', 'К'), ('S', 'Ы'), ('T', 'Е'),
             ('U', 'Г'), ('V', 'М'), ('W', 'Ц'), ('X', 'Ч'), ('Y', 'Н'),
             ('Z', 'Я'),
-            ('[', 'х'), (']', 'ъ'), ('{', 'Х'), ('}', 'Ъ'),
+            ('`', 'ё'), ('~', 'Ё'),
+            ('1', '1'), ('2', '2'), ('3', '3'), ('4', '4'), ('5', '5'),
+            ('6', '6'), ('7', '7'), ('8', '8'), ('9', '9'), ('0', '0'),
+            ('-', '-'), ('=', '='),
+            ('[', 'х'), (']', 'ъ'),
+            ('{', 'Х'), ('}', 'Ъ'),
             (';', 'ж'), (':', 'Ж'),
             ('\'', 'э'), ('"', 'Э'),
             (',', 'б'), ('<', 'Б'),
             ('.', 'ю'), ('>', 'Ю'),
             ('/', '.'), ('?', ','),
-            ('`', 'ё'), ('~', 'Ё'),
-            ('&', '?'), ('|', '/'),
-            ('@', '"'), ('#', '№'),
-            ('$', ';'), ('^', ':'),
-            ('(', '9'), (')', '0'),
-            ('-', '-'), ('_', '_'),
-            ('=', '='), ('+', '+'),
-            ('*', '*'), ('%', '%'),
+            ('\\', '\\'), ('|', '/'),
+            ('!', '!'), ('@', '"'), ('#', '№'), ('$', ';'), ('%', '%'),
+            ('^', ':'), ('&', '?'), ('*', '*'), ('(', '('), (')', ')'),
+            ('_', '_'), ('+', '+'),
         ].iter().cloned().collect();
 
-        let rus_to_eng: HashMap<char, char> = eng_to_rus.iter().map(|(&k, &v)| (v, k)).collect();
+        let rus_to_eng: HashMap<char, char> = [
+            ('ф', 'a'), ('и', 'b'), ('с', 'c'), ('в', 'd'), ('у', 'e'),
+            ('а', 'f'), ('п', 'g'), ('р', 'h'), ('ш', 'i'), ('о', 'j'),
+            ('л', 'k'), ('д', 'l'), ('ь', 'm'), ('т', 'n'), ('щ', 'o'),
+            ('з', 'p'), ('й', 'q'), ('к', 'r'), ('ы', 's'), ('е', 't'),
+            ('г', 'u'), ('м', 'v'), ('ц', 'w'), ('ч', 'x'), ('н', 'y'),
+            ('я', 'z'),
+            ('Ф', 'A'), ('И', 'B'), ('С', 'C'), ('В', 'D'), ('У', 'E'),
+            ('А', 'F'), ('П', 'G'), ('Р', 'H'), ('Ш', 'I'), ('О', 'J'),
+            ('Л', 'K'), ('Д', 'L'), ('Ь', 'M'), ('Т', 'N'), ('Щ', 'O'),
+            ('З', 'P'), ('Й', 'Q'), ('К', 'R'), ('Ы', 'S'), ('Е', 'T'),
+            ('Г', 'U'), ('М', 'V'), ('Ц', 'W'), ('Ч', 'X'), ('Н', 'Y'),
+            ('Я', 'Z'),
+            ('ё', '`'), ('Ё', '~'),
+            ('1', '1'), ('2', '2'), ('3', '3'), ('4', '4'), ('5', '5'),
+            ('6', '6'), ('7', '7'), ('8', '8'), ('9', '9'), ('0', '0'),
+            ('-', '-'), ('=', '='),
+            ('х', '['), ('ъ', ']'),
+            ('Х', '{'), ('Ъ', '}'),
+            ('ж', ';'), ('Ж', ':'),
+            ('э', '\''), ('Э', '"'),
+            ('б', ','), ('Б', '<'),
+            ('ю', '.'), ('Ю', '>'),
+            ('.', '/'), (',', '?'),
+            ('\\', '\\'), ('/', '|'),
+            ('!', '!'), ('"', '@'), ('№', '#'), (';', '$'), ('%', '%'),
+            (':', '^'), ('?', '&'), ('*', '*'), ('(', '('), (')', ')'),
+            ('_', '_'), ('+', '+'),
+        ].iter().cloned().collect();
+
         let current_layout = self.get_current_layout().unwrap_or(0);
 
         text.chars().map(|c| {
@@ -270,32 +348,37 @@ impl KeyboardLayoutSwitcher {
 
     fn handle_shift_count(&self, count: usize) -> Result<()> {
         let words = count - 1;
-        info!("Shift pressed {} times, converting last {} words...", count, words);
+        info!("Shift {} times, converting {} words", count, words);
+        
+        let text_to_convert = {
+            let buf = self.char_buffer.lock().unwrap();
+            Self::take_last_n_words(&buf, words)
+        };
+        
+        if text_to_convert.is_empty() {
+            info!("No words to convert");
+            return Ok(());
+        }
+        info!("To convert: '{}'", text_to_convert);
+        
+        let converted = self.convert_layout(&text_to_convert);
+        info!("Converted: '{}'", converted);
         
         for _ in 0..words {
             self.simulate_key(&["ctrl", "shift", "Left"])?;
             thread::sleep(Duration::from_millis(30));
         }
-        
-        thread::sleep(Duration::from_millis(200));
-        let selected_text = self.get_primary_selection();
-        
-        if selected_text.is_empty() {
-            info!("Nothing selected, aborting");
-            return Ok(());
-        }
-        
-        let converted_text = self.convert_layout(&selected_text);
-        
+        thread::sleep(Duration::from_millis(50));
         self.simulate_key(&["BackSpace"])?;
         thread::sleep(Duration::from_millis(50));
         
-        let current_layout = self.get_current_layout().unwrap_or(0);
-        let target_layout = if current_layout == 0 { 1 } else { 0 };
-        self.switch_layout(target_layout)?;
+        let current = self.get_current_layout().unwrap_or(0);
+        let target = if current == 0 { 1 } else { 0 };
+        self.switch_layout(target)?;
+        thread::sleep(Duration::from_millis(100));
         
-        thread::sleep(Duration::from_millis(50));
-        self.type_text(&converted_text)?;
+        self.type_text_uinput(&converted, target)?;
+        self.char_buffer.lock().unwrap().clear();
         
         Ok(())
     }
@@ -308,23 +391,27 @@ impl KeyboardLayoutSwitcher {
         let caps_space_triggered = Arc::clone(&self.caps_space_triggered);
         let shift_count = Arc::clone(&self.shift_count);
         let last_shift_time = Arc::clone(&self.last_shift_time);
+        let char_buffer = Arc::clone(&self.char_buffer);
+        let buffer_window_id = Arc::clone(&self.buffer_window_id);
 
         thread::spawn(move || {
             let mut pressed_keys = HashSet::new();
             let mut modifiers = ModifierState::default();
             let mut last_hotkey = SystemTime::now();
+            let mut current_layout_is_ru = false;
+            let mut last_layout_poll = Instant::now();
 
             let callback = move |event: KbdEvent| {
                 match event.event_type {
-                    EventType::KeyPress(key) => {
+                    RdevEventType::KeyPress(key) => {
                         pressed_keys.insert(key.clone());
                         modifiers.update(&key, true);
 
-                        if key == Key::CapsLock {
+                        if key == RdevKey::CapsLock {
                             *caps_lock.lock().unwrap() = true;
                         }
                         
-                        if key == Key::Space {
+                        if key == RdevKey::Space {
                             let caps_is_pressed;
                             {
                                 *space_pressed.lock().unwrap() = true;
@@ -333,6 +420,8 @@ impl KeyboardLayoutSwitcher {
                             
                             if caps_is_pressed {
                                 *caps_space_triggered.lock().unwrap() = true;
+                                char_buffer.lock().unwrap().clear();  // Очищаем буфер
+                                *buffer_window_id.lock().unwrap() = None;  // Сбрасываем окно
                                 let switcher_clone = switcher.clone();
                                 thread::spawn(move || {
                                     let _ = switcher_clone.simulate_key(&["BackSpace"]);
@@ -340,10 +429,16 @@ impl KeyboardLayoutSwitcher {
                                     info!("Switching to Russian layout (CapsLock+Space)");
                                     let _ = switcher_clone.switch_layout(1);
                                 });
+                            } else {
+                                let mut buf = char_buffer.lock().unwrap();
+                                buf.push(' ');
+                                if buf.len() > MAX_CHARS {
+                                    *buf = buf[buf.len() - MAX_CHARS..].to_string();
+                                }
                             }
                         }
 
-                        if key == Key::ShiftLeft || key == Key::ShiftRight {
+                        if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
                             let now = Instant::now();
                             let mut last = last_shift_time.lock().unwrap();
                             let mut count = shift_count.lock().unwrap();
@@ -357,6 +452,42 @@ impl KeyboardLayoutSwitcher {
                             *last = now;
                         } else {
                             *shift_count.lock().unwrap() = 0;
+                        }
+
+                        if Self::is_typing_key(&key) && last_layout_poll.elapsed() > Duration::from_millis(250) {
+                            if let Some(layout) = switcher.get_current_layout() {
+                                current_layout_is_ru = layout == 1;
+                            }
+                            last_layout_poll = Instant::now();
+                        }
+
+                        if Self::is_typing_key(&key) {
+                            // Проверяем, что ввод в том же окне
+                            let current_window = switcher.get_active_window();
+                            let mut buf_window = buffer_window_id.lock().unwrap();
+                            
+                            if *buf_window != current_window {
+                                // Окно сменилось - очищаем буфер
+                                char_buffer.lock().unwrap().clear();
+                                *buf_window = current_window;
+                            }
+                            
+                            if let Some(c) = char_from_key(&key, modifiers.shift, current_layout_is_ru) {
+                                let mut buf = char_buffer.lock().unwrap();
+                                buf.push(c);
+                                if buf.len() > MAX_CHARS {
+                                    *buf = buf[buf.len() - MAX_CHARS..].to_string();
+                                }
+                            }
+                        }
+
+                        if Self::is_boundary(&key) {
+                            char_buffer.lock().unwrap().clear();
+                        }
+
+                        if key == RdevKey::Backspace {
+                            let mut buf = char_buffer.lock().unwrap();
+                            buf.pop();
                         }
 
                         let hotkey = {
@@ -380,11 +511,11 @@ impl KeyboardLayoutSwitcher {
                             }
                         }
                     }
-                    EventType::KeyRelease(key) => {
+                    RdevEventType::KeyRelease(key) => {
                         pressed_keys.remove(&key);
                         modifiers.update(&key, false);
 
-                        if key == Key::CapsLock {
+                        if key == RdevKey::CapsLock {
                             *caps_lock.lock().unwrap() = false;
                             let triggered;
                             let space_was_pressed;
@@ -400,6 +531,8 @@ impl KeyboardLayoutSwitcher {
                             }
                             
                             if !triggered && !space_was_pressed {
+                                char_buffer.lock().unwrap().clear();  // Очищаем буфер
+                                *buffer_window_id.lock().unwrap() = None;  // Сбрасываем окно
                                 let switcher_clone = switcher.clone();
                                 thread::spawn(move || {
                                     info!("CapsLock alone - switching to English");
@@ -408,11 +541,11 @@ impl KeyboardLayoutSwitcher {
                             }
                         }
 
-                        if key == Key::Space {
+                        if key == RdevKey::Space {
                             *space_pressed.lock().unwrap() = false;
                         }
 
-                        if key == Key::ShiftLeft || key == Key::ShiftRight {
+                        if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
                             let count = *shift_count.lock().unwrap();
                             
                             if count >= 2 {
@@ -460,24 +593,28 @@ impl KeyboardLayoutSwitcher {
         }
     }
 
-    fn handle_window_change(&mut self, window_id: u32) -> Result<()> {
-        if self.last_window_id == Some(window_id) { return Ok(()); }
+fn handle_window_change(&mut self, window_id: u32) -> Result<()> {
+    if self.last_window_id == Some(window_id) { return Ok(()); }
 
-        info!("Window changed to {}", window_id);
-        self.last_window_id = Some(window_id);
+    info!("Window changed to {}", window_id);
+    self.last_window_id = Some(window_id);
 
-        if let Some(window_class) = self.get_window_class(window_id) {
-            let config = self.config.lock().map_err(|e| anyhow!("Config lock error: {}", e))?;
-            if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
-                if let Some(current_layout) = self.get_current_layout() {
-                    if current_layout != target_layout {
-                        self.switch_layout(target_layout)?;
-                    }
+    // Очищаем буфер при смене окна
+    self.char_buffer.lock().unwrap().clear();
+    *self.buffer_window_id.lock().unwrap() = Some(window_id);
+
+    if let Some(window_class) = self.get_window_class(window_id) {
+        let config = self.config.lock().map_err(|e| anyhow!("Config lock error: {}", e))?;
+        if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
+            if let Some(current_layout) = self.get_current_layout() {
+                if current_layout != target_layout {
+                    self.switch_layout(target_layout)?;
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
+}
 
     fn run(&mut self) -> Result<()> {
         self.start_keyboard_listener()?;
@@ -530,6 +667,269 @@ impl Clone for KeyboardLayoutSwitcher {
             caps_space_triggered: Arc::clone(&self.caps_space_triggered),
             shift_count: Arc::clone(&self.shift_count),
             last_shift_time: Arc::clone(&self.last_shift_time),
+            char_buffer: Arc::clone(&self.char_buffer),
+            buffer_window_id: Arc::clone(&self.buffer_window_id),
+            uinput: Arc::clone(&self.uinput),
+        }
+    }
+}
+
+fn create_virtual_keyboard() -> Result<evdev::uinput::VirtualDevice> {
+    let mut keys = AttributeSet::new();
+    let all_keys = [
+        Key::KEY_A, Key::KEY_B, Key::KEY_C, Key::KEY_D, Key::KEY_E,
+        Key::KEY_F, Key::KEY_G, Key::KEY_H, Key::KEY_I, Key::KEY_J,
+        Key::KEY_K, Key::KEY_L, Key::KEY_M, Key::KEY_N, Key::KEY_O,
+        Key::KEY_P, Key::KEY_Q, Key::KEY_R, Key::KEY_S, Key::KEY_T,
+        Key::KEY_U, Key::KEY_V, Key::KEY_W, Key::KEY_X, Key::KEY_Y,
+        Key::KEY_Z,
+        Key::KEY_0, Key::KEY_1, Key::KEY_2, Key::KEY_3, Key::KEY_4,
+        Key::KEY_5, Key::KEY_6, Key::KEY_7, Key::KEY_8, Key::KEY_9,
+        Key::KEY_SPACE, Key::KEY_ENTER, Key::KEY_BACKSPACE,
+        Key::KEY_LEFTSHIFT, Key::KEY_RIGHTSHIFT,
+        Key::KEY_LEFTCTRL, Key::KEY_RIGHTCTRL,
+        Key::KEY_LEFTALT, Key::KEY_RIGHTALT,
+        Key::KEY_MINUS, Key::KEY_EQUAL,
+        Key::KEY_LEFTBRACE, Key::KEY_RIGHTBRACE,
+        Key::KEY_SEMICOLON, Key::KEY_APOSTROPHE,
+        Key::KEY_COMMA, Key::KEY_DOT, Key::KEY_SLASH,
+        Key::KEY_BACKSLASH, Key::KEY_GRAVE,
+        Key::KEY_TAB, Key::KEY_ESC,
+        Key::KEY_LEFT, Key::KEY_RIGHT, Key::KEY_UP, Key::KEY_DOWN,
+        Key::KEY_HOME, Key::KEY_END, Key::KEY_PAGEUP, Key::KEY_PAGEDOWN,
+        Key::KEY_DELETE, Key::KEY_INSERT,
+    ];
+    for k in all_keys {
+        keys.insert(k);
+    }
+
+    let dev = VirtualDeviceBuilder::new()
+        .context("Failed to create VirtualDeviceBuilder")?
+        .name("nskbd-virtual-keyboard")
+        .with_keys(&keys)
+        .context("Failed to set keys")?
+        .build()
+        .context("Failed to create virtual device")?;
+    
+    Ok(dev)
+}
+
+fn char_from_key(key: &RdevKey, shift: bool, layout_is_ru: bool) -> Option<char> {
+    if layout_is_ru {
+        match key {
+            RdevKey::KeyA => if shift { Some('Ф') } else { Some('ф') },
+            RdevKey::KeyB => if shift { Some('И') } else { Some('и') },
+            RdevKey::KeyC => if shift { Some('С') } else { Some('с') },
+            RdevKey::KeyD => if shift { Some('В') } else { Some('в') },
+            RdevKey::KeyE => if shift { Some('У') } else { Some('у') },
+            RdevKey::KeyF => if shift { Some('А') } else { Some('а') },
+            RdevKey::KeyG => if shift { Some('П') } else { Some('п') },
+            RdevKey::KeyH => if shift { Some('Р') } else { Some('р') },
+            RdevKey::KeyI => if shift { Some('Ш') } else { Some('ш') },
+            RdevKey::KeyJ => if shift { Some('О') } else { Some('о') },
+            RdevKey::KeyK => if shift { Some('Л') } else { Some('л') },
+            RdevKey::KeyL => if shift { Some('Д') } else { Some('д') },
+            RdevKey::KeyM => if shift { Some('Ь') } else { Some('ь') },
+            RdevKey::KeyN => if shift { Some('Т') } else { Some('т') },
+            RdevKey::KeyO => if shift { Some('Щ') } else { Some('щ') },
+            RdevKey::KeyP => if shift { Some('З') } else { Some('з') },
+            RdevKey::KeyQ => if shift { Some('Й') } else { Some('й') },
+            RdevKey::KeyR => if shift { Some('К') } else { Some('к') },
+            RdevKey::KeyS => if shift { Some('Ы') } else { Some('ы') },
+            RdevKey::KeyT => if shift { Some('Е') } else { Some('е') },
+            RdevKey::KeyU => if shift { Some('Г') } else { Some('г') },
+            RdevKey::KeyV => if shift { Some('М') } else { Some('м') },
+            RdevKey::KeyW => if shift { Some('Ц') } else { Some('ц') },
+            RdevKey::KeyX => if shift { Some('Ч') } else { Some('ч') },
+            RdevKey::KeyY => if shift { Some('Н') } else { Some('н') },
+            RdevKey::KeyZ => if shift { Some('Я') } else { Some('я') },
+            RdevKey::Num0 => if shift { Some(')') } else { Some('0') },
+            RdevKey::Num1 => if shift { Some('!') } else { Some('1') },
+            RdevKey::Num2 => if shift { Some('"') } else { Some('2') },
+            RdevKey::Num3 => if shift { Some('№') } else { Some('3') },
+            RdevKey::Num4 => if shift { Some(';') } else { Some('4') },
+            RdevKey::Num5 => if shift { Some('%') } else { Some('5') },
+            RdevKey::Num6 => if shift { Some(':') } else { Some('6') },
+            RdevKey::Num7 => if shift { Some('?') } else { Some('7') },
+            RdevKey::Num8 => if shift { Some('*') } else { Some('8') },
+            RdevKey::Num9 => if shift { Some('(') } else { Some('9') },
+            RdevKey::Minus => if shift { Some('_') } else { Some('-') },
+            RdevKey::Equal => if shift { Some('+') } else { Some('=') },
+            RdevKey::LeftBracket => if shift { Some('Х') } else { Some('х') },
+            RdevKey::RightBracket => if shift { Some('Ъ') } else { Some('ъ') },
+            RdevKey::SemiColon => if shift { Some('Ж') } else { Some('ж') },
+            RdevKey::Quote => if shift { Some('Э') } else { Some('э') },
+            RdevKey::Comma => if shift { Some('Б') } else { Some('б') },
+            RdevKey::Dot => if shift { Some('Ю') } else { Some('ю') },
+            RdevKey::Slash => if shift { Some(',') } else { Some('.') },
+            RdevKey::BackSlash => if shift { Some('/') } else { Some('\\') },
+            RdevKey::Space => Some(' '),
+            _ => None,
+        }
+    } else {
+        match key {
+            RdevKey::KeyA => if shift { Some('A') } else { Some('a') },
+            RdevKey::KeyB => if shift { Some('B') } else { Some('b') },
+            RdevKey::KeyC => if shift { Some('C') } else { Some('c') },
+            RdevKey::KeyD => if shift { Some('D') } else { Some('d') },
+            RdevKey::KeyE => if shift { Some('E') } else { Some('e') },
+            RdevKey::KeyF => if shift { Some('F') } else { Some('f') },
+            RdevKey::KeyG => if shift { Some('G') } else { Some('g') },
+            RdevKey::KeyH => if shift { Some('H') } else { Some('h') },
+            RdevKey::KeyI => if shift { Some('I') } else { Some('i') },
+            RdevKey::KeyJ => if shift { Some('J') } else { Some('j') },
+            RdevKey::KeyK => if shift { Some('K') } else { Some('k') },
+            RdevKey::KeyL => if shift { Some('L') } else { Some('l') },
+            RdevKey::KeyM => if shift { Some('M') } else { Some('m') },
+            RdevKey::KeyN => if shift { Some('N') } else { Some('n') },
+            RdevKey::KeyO => if shift { Some('O') } else { Some('o') },
+            RdevKey::KeyP => if shift { Some('P') } else { Some('p') },
+            RdevKey::KeyQ => if shift { Some('Q') } else { Some('q') },
+            RdevKey::KeyR => if shift { Some('R') } else { Some('r') },
+            RdevKey::KeyS => if shift { Some('S') } else { Some('s') },
+            RdevKey::KeyT => if shift { Some('T') } else { Some('t') },
+            RdevKey::KeyU => if shift { Some('U') } else { Some('u') },
+            RdevKey::KeyV => if shift { Some('V') } else { Some('v') },
+            RdevKey::KeyW => if shift { Some('W') } else { Some('w') },
+            RdevKey::KeyX => if shift { Some('X') } else { Some('x') },
+            RdevKey::KeyY => if shift { Some('Y') } else { Some('y') },
+            RdevKey::KeyZ => if shift { Some('Z') } else { Some('z') },
+            RdevKey::Num0 => if shift { Some(')') } else { Some('0') },
+            RdevKey::Num1 => if shift { Some('!') } else { Some('1') },
+            RdevKey::Num2 => if shift { Some('@') } else { Some('2') },
+            RdevKey::Num3 => if shift { Some('#') } else { Some('3') },
+            RdevKey::Num4 => if shift { Some('$') } else { Some('4') },
+            RdevKey::Num5 => if shift { Some('%') } else { Some('5') },
+            RdevKey::Num6 => if shift { Some('^') } else { Some('6') },
+            RdevKey::Num7 => if shift { Some('&') } else { Some('7') },
+            RdevKey::Num8 => if shift { Some('*') } else { Some('8') },
+            RdevKey::Num9 => if shift { Some('(') } else { Some('9') },
+            RdevKey::Minus => if shift { Some('_') } else { Some('-') },
+            RdevKey::Equal => if shift { Some('+') } else { Some('=') },
+            RdevKey::LeftBracket => if shift { Some('{') } else { Some('[') },
+            RdevKey::RightBracket => if shift { Some('}') } else { Some(']') },
+            RdevKey::SemiColon => if shift { Some(':') } else { Some(';') },
+            RdevKey::Quote => if shift { Some('"') } else { Some('\'') },
+            RdevKey::Comma => if shift { Some('<') } else { Some(',') },
+            RdevKey::Dot => if shift { Some('>') } else { Some('.') },
+            RdevKey::Slash => if shift { Some('?') } else { Some('/') },
+            RdevKey::BackSlash => if shift { Some('|') } else { Some('\\') },
+            RdevKey::Space => Some(' '),
+            _ => None,
+        }
+    }
+}
+
+fn char_to_keycode(ch: char, layout_is_ru: bool) -> Option<(u16, bool)> {
+    if layout_is_ru {
+        match ch {
+            // Русские буквы
+            'ф' | 'Ф' => Some((Key::KEY_A.code(), ch == 'Ф')),
+            'и' | 'И' => Some((Key::KEY_B.code(), ch == 'И')),
+            'с' | 'С' => Some((Key::KEY_C.code(), ch == 'С')),
+            'в' | 'В' => Some((Key::KEY_D.code(), ch == 'В')),
+            'у' | 'У' => Some((Key::KEY_E.code(), ch == 'У')),
+            'а' | 'А' => Some((Key::KEY_F.code(), ch == 'А')),
+            'п' | 'П' => Some((Key::KEY_G.code(), ch == 'П')),
+            'р' | 'Р' => Some((Key::KEY_H.code(), ch == 'Р')),
+            'ш' | 'Ш' => Some((Key::KEY_I.code(), ch == 'Ш')),
+            'о' | 'О' => Some((Key::KEY_J.code(), ch == 'О')),
+            'л' | 'Л' => Some((Key::KEY_K.code(), ch == 'Л')),
+            'д' | 'Д' => Some((Key::KEY_L.code(), ch == 'Д')),
+            'ь' | 'Ь' => Some((Key::KEY_M.code(), ch == 'Ь')),
+            'т' | 'Т' => Some((Key::KEY_N.code(), ch == 'Т')),
+            'щ' | 'Щ' => Some((Key::KEY_O.code(), ch == 'Щ')),
+            'з' | 'З' => Some((Key::KEY_P.code(), ch == 'З')),
+            'й' | 'Й' => Some((Key::KEY_Q.code(), ch == 'Й')),
+            'к' | 'К' => Some((Key::KEY_R.code(), ch == 'К')),
+            'ы' | 'Ы' => Some((Key::KEY_S.code(), ch == 'Ы')),
+            'е' | 'Е' => Some((Key::KEY_T.code(), ch == 'Е')),
+            'г' | 'Г' => Some((Key::KEY_U.code(), ch == 'Г')),
+            'м' | 'М' => Some((Key::KEY_V.code(), ch == 'М')),
+            'ц' | 'Ц' => Some((Key::KEY_W.code(), ch == 'Ц')),
+            'ч' | 'Ч' => Some((Key::KEY_X.code(), ch == 'Ч')),
+            'н' | 'Н' => Some((Key::KEY_Y.code(), ch == 'Н')),
+            'я' | 'Я' => Some((Key::KEY_Z.code(), ch == 'Я')),
+            
+            // Спецсимволы русской раскладки
+            ' ' => Some((Key::KEY_SPACE.code(), false)),
+            '0' | ')' => Some((Key::KEY_0.code(), ch == ')')),
+            '1' | '!' => Some((Key::KEY_1.code(), ch == '!')),
+            '2' | '"' => Some((Key::KEY_2.code(), ch == '"')),
+            '3' | '№' => Some((Key::KEY_3.code(), ch == '№')),
+            '4' | ';' => Some((Key::KEY_4.code(), ch == ';')),
+            '5' | '%' => Some((Key::KEY_5.code(), ch == '%')),
+            '6' | ':' => Some((Key::KEY_6.code(), ch == ':')),
+            '7' | '?' => Some((Key::KEY_7.code(), ch == '?')),
+            '8' | '*' => Some((Key::KEY_8.code(), ch == '*')),
+            '9' | '(' => Some((Key::KEY_9.code(), ch == '(')),
+            '-' | '_' => Some((Key::KEY_MINUS.code(), ch == '_')),
+            '=' | '+' => Some((Key::KEY_EQUAL.code(), ch == '+')),
+            'х' | 'Х' => Some((Key::KEY_LEFTBRACE.code(), ch == 'Х')),
+            'ъ' | 'Ъ' => Some((Key::KEY_RIGHTBRACE.code(), ch == 'Ъ')),
+            'ж' | 'Ж' => Some((Key::KEY_SEMICOLON.code(), ch == 'Ж')),
+            'э' | 'Э' => Some((Key::KEY_APOSTROPHE.code(), ch == 'Э')),
+            'б' | 'Б' => Some((Key::KEY_COMMA.code(), ch == 'Б')),
+            'ю' | 'Ю' => Some((Key::KEY_DOT.code(), ch == 'Ю')),
+            '.' | ',' => Some((Key::KEY_SLASH.code(), ch == ',')),
+            '/' | '\\' => Some((Key::KEY_BACKSLASH.code(), ch == '\\')),
+            'ё' | 'Ё' => Some((Key::KEY_GRAVE.code(), ch == 'Ё')),
+            _ => None,
+        }
+    } else {
+        match ch {
+            // Английские буквы
+            'a' | 'A' => Some((Key::KEY_A.code(), ch == 'A')),
+            'b' | 'B' => Some((Key::KEY_B.code(), ch == 'B')),
+            'c' | 'C' => Some((Key::KEY_C.code(), ch == 'C')),
+            'd' | 'D' => Some((Key::KEY_D.code(), ch == 'D')),
+            'e' | 'E' => Some((Key::KEY_E.code(), ch == 'E')),
+            'f' | 'F' => Some((Key::KEY_F.code(), ch == 'F')),
+            'g' | 'G' => Some((Key::KEY_G.code(), ch == 'G')),
+            'h' | 'H' => Some((Key::KEY_H.code(), ch == 'H')),
+            'i' | 'I' => Some((Key::KEY_I.code(), ch == 'I')),
+            'j' | 'J' => Some((Key::KEY_J.code(), ch == 'J')),
+            'k' | 'K' => Some((Key::KEY_K.code(), ch == 'K')),
+            'l' | 'L' => Some((Key::KEY_L.code(), ch == 'L')),
+            'm' | 'M' => Some((Key::KEY_M.code(), ch == 'M')),
+            'n' | 'N' => Some((Key::KEY_N.code(), ch == 'N')),
+            'o' | 'O' => Some((Key::KEY_O.code(), ch == 'O')),
+            'p' | 'P' => Some((Key::KEY_P.code(), ch == 'P')),
+            'q' | 'Q' => Some((Key::KEY_Q.code(), ch == 'Q')),
+            'r' | 'R' => Some((Key::KEY_R.code(), ch == 'R')),
+            's' | 'S' => Some((Key::KEY_S.code(), ch == 'S')),
+            't' | 'T' => Some((Key::KEY_T.code(), ch == 'T')),
+            'u' | 'U' => Some((Key::KEY_U.code(), ch == 'U')),
+            'v' | 'V' => Some((Key::KEY_V.code(), ch == 'V')),
+            'w' | 'W' => Some((Key::KEY_W.code(), ch == 'W')),
+            'x' | 'X' => Some((Key::KEY_X.code(), ch == 'X')),
+            'y' | 'Y' => Some((Key::KEY_Y.code(), ch == 'Y')),
+            'z' | 'Z' => Some((Key::KEY_Z.code(), ch == 'Z')),
+            
+            // Спецсимволы английской раскладки
+            ' ' => Some((Key::KEY_SPACE.code(), false)),
+            '0' | ')' => Some((Key::KEY_0.code(), ch == ')')),
+            '1' | '!' => Some((Key::KEY_1.code(), ch == '!')),
+            '2' | '@' => Some((Key::KEY_2.code(), ch == '@')),
+            '3' | '#' => Some((Key::KEY_3.code(), ch == '#')),
+            '4' | '$' => Some((Key::KEY_4.code(), ch == '$')),
+            '5' | '%' => Some((Key::KEY_5.code(), ch == '%')),
+            '6' | '^' => Some((Key::KEY_6.code(), ch == '^')),
+            '7' | '&' => Some((Key::KEY_7.code(), ch == '&')),
+            '8' | '*' => Some((Key::KEY_8.code(), ch == '*')),
+            '9' | '(' => Some((Key::KEY_9.code(), ch == '(')),
+            '-' | '_' => Some((Key::KEY_MINUS.code(), ch == '_')),
+            '=' | '+' => Some((Key::KEY_EQUAL.code(), ch == '+')),
+            '[' | '{' => Some((Key::KEY_LEFTBRACE.code(), ch == '{')),
+            ']' | '}' => Some((Key::KEY_RIGHTBRACE.code(), ch == '}')),
+            ';' | ':' => Some((Key::KEY_SEMICOLON.code(), ch == ':')),
+            '\'' | '"' => Some((Key::KEY_APOSTROPHE.code(), ch == '"')),
+            ',' | '<' => Some((Key::KEY_COMMA.code(), ch == '<')),
+            '.' | '>' => Some((Key::KEY_DOT.code(), ch == '>')),
+            '/' | '?' => Some((Key::KEY_SLASH.code(), ch == '?')),
+            '\\' | '|' => Some((Key::KEY_BACKSLASH.code(), ch == '|')),
+            '`' | '~' => Some((Key::KEY_GRAVE.code(), ch == '~')),
+            _ => None,
         }
     }
 }
