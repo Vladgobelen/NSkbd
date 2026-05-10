@@ -12,7 +12,7 @@ use std::{
     process::Command,
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use x11rb::{
     connection::Connection,
@@ -68,6 +68,8 @@ struct KeyboardLayoutSwitcher {
     caps_lock_pressed: Arc<Mutex<bool>>,
     space_pressed: Arc<Mutex<bool>>,
     caps_space_triggered: Arc<Mutex<bool>>,
+    shift_count: Arc<Mutex<u32>>,
+    last_shift_time: Arc<Mutex<Instant>>,
 }
 
 impl KeyboardLayoutSwitcher {
@@ -105,6 +107,8 @@ impl KeyboardLayoutSwitcher {
             caps_lock_pressed: Arc::new(Mutex::new(false)),
             space_pressed: Arc::new(Mutex::new(false)),
             caps_space_triggered: Arc::new(Mutex::new(false)),
+            shift_count: Arc::new(Mutex::new(0)),
+            last_shift_time: Arc::new(Mutex::new(Instant::now())),
         })
     }
 
@@ -307,13 +311,13 @@ impl KeyboardLayoutSwitcher {
         let caps_lock = Arc::clone(&self.caps_lock_pressed);
         let space_pressed = Arc::clone(&self.space_pressed);
         let caps_space_triggered = Arc::clone(&self.caps_space_triggered);
+        let shift_count = Arc::clone(&self.shift_count);
+        let last_shift_time = Arc::clone(&self.last_shift_time);
 
         thread::spawn(move || {
             let mut pressed_keys = HashSet::new();
             let mut modifiers = ModifierState::default();
             let mut last_hotkey = SystemTime::now();
-            let shift_count = Arc::new(Mutex::new(0u32));
-            let shift_count_clone = Arc::clone(&shift_count);
 
             let callback = move |event: KbdEvent| {
                 match event.event_type {
@@ -345,11 +349,19 @@ impl KeyboardLayoutSwitcher {
                         }
 
                         if key == Key::ShiftLeft || key == Key::ShiftRight {
+                            let now = Instant::now();
+                            let mut last = last_shift_time.lock().unwrap();
                             let mut count = shift_count.lock().unwrap();
-                            *count += 1;
+                            let elapsed = now.duration_since(*last);
+                            
+                            if *count > 0 && elapsed > Duration::from_millis(300) {
+                                *count = 1;
+                            } else {
+                                *count += 1;
+                            }
+                            *last = now;
                         } else {
-                            let mut count = shift_count.lock().unwrap();
-                            *count = 0;
+                            *shift_count.lock().unwrap() = 0;
                         }
 
                         let hotkey = {
@@ -406,21 +418,17 @@ impl KeyboardLayoutSwitcher {
                         }
 
                         if key == Key::ShiftLeft || key == Key::ShiftRight {
-                            let count = {
-                                let c = shift_count_clone.lock().unwrap();
-                                *c
-                            };
+                            let count = *shift_count.lock().unwrap();
                             
                             if count >= 2 {
                                 let switcher_clone = switcher.clone();
-                                let shift_check = Arc::clone(&shift_count_clone);
+                                let shift_check = Arc::clone(&shift_count);
                                 let captured_count = count.min(10) as usize;
                                 
                                 thread::spawn(move || {
                                     thread::sleep(Duration::from_millis(300));
                                     let final_count = *shift_check.lock().unwrap();
-                                    // Если за 300ms не было новых нажатий (счётчик не изменился или был сброшен другой клавишей)
-                                    if final_count == 0 || final_count == captured_count as u32 {
+                                    if final_count == captured_count as u32 {
                                         *shift_check.lock().unwrap() = 0;
                                         info!("Shift series detected: {} presses", captured_count);
                                         if let Err(e) = switcher_clone.handle_shift_count(captured_count) {
@@ -525,6 +533,8 @@ impl Clone for KeyboardLayoutSwitcher {
             caps_lock_pressed: Arc::clone(&self.caps_lock_pressed),
             space_pressed: Arc::clone(&self.space_pressed),
             caps_space_triggered: Arc::clone(&self.caps_space_triggered),
+            shift_count: Arc::clone(&self.shift_count),
+            last_shift_time: Arc::clone(&self.last_shift_time),
         }
     }
 }
