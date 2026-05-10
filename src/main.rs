@@ -199,25 +199,20 @@ impl KeyboardLayoutSwitcher {
         self.xkb.set_layout(layout)
     }
 
-    fn get_clipboard_text(&self) -> Result<String> {
-        let output = Command::new("xclip")
-            .args(["-selection", "clipboard", "-o"])
+    fn get_primary_selection(&self) -> String {
+        Command::new("xclip")
+            .args(["-selection", "primary", "-o"])
             .output()
-            .context("Failed to get clipboard")?;
-        if !output.status.success() { return Err(anyhow!("xclip failed")); }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
     }
 
-    fn set_clipboard_text(&self, text: &str) -> Result<()> {
-        let mut child = Command::new("xclip")
-            .args(["-selection", "clipboard", "-i"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("Failed to spawn xclip")?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(text.as_bytes()).context("Failed to write to xclip stdin")?;
-        }
-        child.wait_with_output().context("Failed to wait for xclip")?;
+    fn type_text(&self, text: &str) -> Result<()> {
+        let output = Command::new("xdotool")
+            .args(["type", "--delay", "0", text])
+            .output()
+            .context("Failed to type text")?;
+        if !output.status.success() { return Err(anyhow!("xdotool type failed")); }
         Ok(())
     }
 
@@ -279,28 +274,28 @@ impl KeyboardLayoutSwitcher {
         
         for _ in 0..words {
             self.simulate_key(&["ctrl", "shift", "Left"])?;
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(30));
         }
         
-        thread::sleep(Duration::from_millis(50));
-        self.simulate_key(&["ctrl", "x"])?;
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(200));
+        let selected_text = self.get_primary_selection();
         
-        let clipboard_text = self.get_clipboard_text()?;
-        if clipboard_text.is_empty() {
-            info!("Clipboard is empty, nothing to convert");
+        if selected_text.is_empty() {
+            info!("Nothing selected, aborting");
             return Ok(());
         }
         
-        let converted_text = self.convert_layout(&clipboard_text);
-        self.set_clipboard_text(&converted_text)?;
+        let converted_text = self.convert_layout(&selected_text);
+        
+        self.simulate_key(&["BackSpace"])?;
+        thread::sleep(Duration::from_millis(50));
         
         let current_layout = self.get_current_layout().unwrap_or(0);
         let target_layout = if current_layout == 0 { 1 } else { 0 };
         self.switch_layout(target_layout)?;
         
         thread::sleep(Duration::from_millis(50));
-        self.simulate_key(&["ctrl", "v"])?;
+        self.type_text(&converted_text)?;
         
         Ok(())
     }
