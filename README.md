@@ -15,8 +15,6 @@
 
 ### Зависимости
 
-Системные:
-
 Python (для проверки орфографии):
 python -m venv .venv
 source .venv/bin/activate
@@ -31,10 +29,6 @@ cargo build --release
 ### Установка spell_server.py
 
 Скопируйте spell_server.py рядом с исполняемым файлом:
-cp spell_server.py target/release/
-
-Либо укажите путь к python с pyspellchecker в config.json:
-"python_interpreter": "/путь/к/.venv/bin/python3"
 
 ## Использование
 
