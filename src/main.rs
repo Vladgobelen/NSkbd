@@ -148,9 +148,8 @@ struct KeyboardLayoutSwitcher {
     conn: Arc<RustConnection>,
     screen_num: usize,
     xkb: XKeyboard,
-    caps_lock_pressed: Arc<Mutex<bool>>,
-    space_pressed: Arc<Mutex<bool>>,
-    caps_space_triggered: Arc<Mutex<bool>>,
+    caps_lock_count: Arc<Mutex<u32>>,
+    last_caps_lock_time: Arc<Mutex<Instant>>,
     shift_count: Arc<Mutex<u32>>,
     last_shift_time: Arc<Mutex<Instant>>,
     char_buffer: Arc<Mutex<String>>,
@@ -197,9 +196,8 @@ impl KeyboardLayoutSwitcher {
             conn,
             screen_num,
             xkb,
-            caps_lock_pressed: Arc::new(Mutex::new(false)),
-            space_pressed: Arc::new(Mutex::new(false)),
-            caps_space_triggered: Arc::new(Mutex::new(false)),
+            caps_lock_count: Arc::new(Mutex::new(0)),
+            last_caps_lock_time: Arc::new(Mutex::new(Instant::now())),
             shift_count: Arc::new(Mutex::new(0)),
             last_shift_time: Arc::new(Mutex::new(Instant::now())),
             char_buffer: Arc::new(Mutex::new(String::with_capacity(MAX_CHARS + 100))),
@@ -657,9 +655,8 @@ impl KeyboardLayoutSwitcher {
     fn start_keyboard_listener(&self) -> Result<()> {
         let config = Arc::clone(&self.config);
         let switcher = self.clone();
-        let caps_lock = Arc::clone(&self.caps_lock_pressed);
-        let space_pressed = Arc::clone(&self.space_pressed);
-        let caps_space_triggered = Arc::clone(&self.caps_space_triggered);
+        let caps_lock_count = Arc::clone(&self.caps_lock_count);
+        let last_caps_lock_time = Arc::clone(&self.last_caps_lock_time);
         let shift_count = Arc::clone(&self.shift_count);
         let last_shift_time = Arc::clone(&self.last_shift_time);
         let char_buffer = Arc::clone(&self.char_buffer);
@@ -681,34 +678,18 @@ impl KeyboardLayoutSwitcher {
                         modifiers.update(&key, true);
 
                         if key == RdevKey::CapsLock {
-                            *caps_lock.lock().unwrap() = true;
+                            let mut count = caps_lock_count.lock().unwrap();
+                            *count += 1;
+                            *last_caps_lock_time.lock().unwrap() = Instant::now();
                         }
-                        
+
                         if key == RdevKey::Space {
-                            let caps_is_pressed;
-                            {
-                                *space_pressed.lock().unwrap() = true;
-                                caps_is_pressed = *caps_lock.lock().unwrap();
-                            }
-                            
-                            if caps_is_pressed {
-                                *caps_space_triggered.lock().unwrap() = true;
-                                char_buffer.lock().unwrap().clear();
-                                *buffer_window_id.lock().unwrap() = None;
-                                let switcher_clone = switcher.clone();
-                                thread::spawn(move || {
-                                    let _ = switcher_clone.send_backspace();
-                                    thread::sleep(Duration::from_millis(30));
-                                    let _ = switcher_clone.switch_layout(1);
-                                });
-                            } else {
-                                let is_replacing = *replacing_text.lock().unwrap();
-                                if !is_replacing {
-                                    let mut buf = char_buffer.lock().unwrap();
-                                    buf.push(' ');
-                                    if buf.len() > MAX_CHARS {
-                                        *buf = buf[buf.len() - MAX_CHARS..].to_string();
-                                    }
+                            let is_replacing = *replacing_text.lock().unwrap();
+                            if !is_replacing {
+                                let mut buf = char_buffer.lock().unwrap();
+                                buf.push(' ');
+                                if buf.len() > MAX_CHARS {
+                                    *buf = buf[buf.len() - MAX_CHARS..].to_string();
                                 }
                             }
                         }
@@ -822,32 +803,29 @@ impl KeyboardLayoutSwitcher {
                         modifiers.update(&key, false);
 
                         if key == RdevKey::CapsLock {
-                            *caps_lock.lock().unwrap() = false;
-                            let triggered;
-                            let space_was_pressed;
-                            {
-                                let mut trig = caps_space_triggered.lock().unwrap();
-                                triggered = *trig;
-                                *trig = false;
-                            }
-                            {
-                                let mut sp = space_pressed.lock().unwrap();
-                                space_was_pressed = *sp;
-                                *sp = false;
-                            }
-                            
-                            if !triggered && !space_was_pressed {
-                                char_buffer.lock().unwrap().clear();
-                                *buffer_window_id.lock().unwrap() = None;
+                            let captured_count = {
+                                *caps_lock_count.lock().unwrap()
+                            };
+                            if captured_count > 0 {
                                 let switcher_clone = switcher.clone();
+                                let caps_count = Arc::clone(&caps_lock_count);
+                                let char_buf = Arc::clone(&char_buffer);
+                                let buf_win = Arc::clone(&buffer_window_id);
                                 thread::spawn(move || {
-                                    let _ = switcher_clone.switch_layout(0);
+                                    thread::sleep(Duration::from_millis(300));
+                                    let final_count = *caps_count.lock().unwrap();
+                                    if final_count == captured_count {
+                                        if captured_count == 1 {
+                                            let _ = switcher_clone.switch_layout(0);
+                                        } else {
+                                            let _ = switcher_clone.switch_layout(1);
+                                        }
+                                        char_buf.lock().unwrap().clear();
+                                        *buf_win.lock().unwrap() = None;
+                                        *caps_count.lock().unwrap() = 0;
+                                    }
                                 });
                             }
-                        }
-
-                        if key == RdevKey::Space {
-                            *space_pressed.lock().unwrap() = false;
                         }
 
                         if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
@@ -965,9 +943,8 @@ impl Clone for KeyboardLayoutSwitcher {
             conn: Arc::clone(&self.conn),
             screen_num: self.screen_num,
             xkb: self.xkb.clone(),
-            caps_lock_pressed: Arc::clone(&self.caps_lock_pressed),
-            space_pressed: Arc::clone(&self.space_pressed),
-            caps_space_triggered: Arc::clone(&self.caps_space_triggered),
+            caps_lock_count: Arc::clone(&self.caps_lock_count),
+            last_caps_lock_time: Arc::clone(&self.last_caps_lock_time),
             shift_count: Arc::clone(&self.shift_count),
             last_shift_time: Arc::clone(&self.last_shift_time),
             char_buffer: Arc::clone(&self.char_buffer),
