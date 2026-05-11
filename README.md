@@ -16,9 +16,6 @@
 ### Зависимости
 
 Системные:
-- Ubuntu/Debian: sudo apt install xdotool
-- Arch: sudo pacman -S xdotool
-- Gentoo: emerge xdotool
 
 Python (для проверки орфографии):
 python -m venv .venv

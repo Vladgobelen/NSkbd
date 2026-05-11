@@ -177,7 +177,7 @@ impl KeyboardLayoutSwitcher {
         WriteLogger::init(LevelFilter::Info, LogConfig::default(), log_file)
             .context("Failed to initialize logger")?;
 
-        info!("Keyboard Layout Switcher started");
+        info!("NSKeyboardLayoutSwitcher started");
 
         let config = AppConfig::load_from_file(&config_path)?;
 
@@ -187,7 +187,6 @@ impl KeyboardLayoutSwitcher {
 
         let uinput = create_virtual_keyboard()?;
         let spell_checker = SpellChecker::new();
-
         let server_process = Arc::new(Mutex::new(None));
 
         let switcher = Self {
@@ -374,22 +373,14 @@ impl KeyboardLayoutSwitcher {
     fn start_spell_server_internal(&self, python_cmd: &str) -> Result<()> {
         let mut proc = match self.server_process.try_lock() {
             Ok(p) => p,
-            Err(_) => {
-                return Ok(());
-            }
+            Err(_) => return Ok(()),
         };
         
         if let Some(ref mut child) = *proc {
             match child.try_wait() {
-                Ok(None) => {
-                    return Ok(());
-                }
-                Ok(Some(_)) => {
-                    *proc = None;
-                }
-                Err(_) => {
-                    *proc = None;
-                }
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) => *proc = None,
+                Err(_) => *proc = None,
             }
         }
 
@@ -401,16 +392,13 @@ impl KeyboardLayoutSwitcher {
                 .args(["-k", "9876/tcp"])
                 .output();
             
-            for i in 0..20 {
+            for _ in 0..20 {
                 thread::sleep(Duration::from_millis(500));
                 if TcpStream::connect_timeout(
                     &std::net::SocketAddr::from(([127, 0, 0, 1], SPELL_SERVER_PORT)),
                     Duration::from_millis(100),
                 ).is_err() {
                     break;
-                }
-                if i == 19 {
-                    return Ok(());
                 }
             }
         }
@@ -481,13 +469,12 @@ impl KeyboardLayoutSwitcher {
         self.xkb.set_layout(layout)
     }
 
-    fn simulate_key(&self, keys: &[&str]) -> Result<()> {
-        let key_sequence = keys.join("+");
-        let output = Command::new("xdotool")
-            .args(["key", &key_sequence])
-            .output()
-            .context("Failed to simulate key")?;
-        if !output.status.success() { return Err(anyhow!("xdotool failed")); }
+    fn send_backspace(&self) -> Result<()> {
+        let mut dev = self.uinput.lock().unwrap();
+        let bs = Key::KEY_BACKSPACE.code();
+        dev.emit(&[InputEvent::new(EventType::KEY, bs, 1)])?;
+        thread::sleep(Duration::from_millis(5));
+        dev.emit(&[InputEvent::new(EventType::KEY, bs, 0)])?;
         Ok(())
     }
 
@@ -628,7 +615,6 @@ impl KeyboardLayoutSwitcher {
         }
         
         let actual_words = text_to_convert.split_whitespace().count();
-        
         let original_layout = self.get_current_layout().unwrap_or(0);
         let (converted_text, converted_is_ru) = self.try_correct_last_word(&text_to_convert);
         info!("Converted: '{}'", converted_text);
@@ -711,9 +697,8 @@ impl KeyboardLayoutSwitcher {
                                 *buffer_window_id.lock().unwrap() = None;
                                 let switcher_clone = switcher.clone();
                                 thread::spawn(move || {
-                                    let _ = switcher_clone.simulate_key(&["BackSpace"]);
+                                    let _ = switcher_clone.send_backspace();
                                     thread::sleep(Duration::from_millis(30));
-                                    info!("Switching to Russian layout");
                                     let _ = switcher_clone.switch_layout(1);
                                 });
                             } else {
@@ -856,7 +841,6 @@ impl KeyboardLayoutSwitcher {
                                 *buffer_window_id.lock().unwrap() = None;
                                 let switcher_clone = switcher.clone();
                                 thread::spawn(move || {
-                                    info!("Switching to English layout");
                                     let _ = switcher_clone.switch_layout(0);
                                 });
                             }
@@ -894,7 +878,6 @@ impl KeyboardLayoutSwitcher {
                 }
             };
 
-            info!("Keyboard listener started");
             if let Err(e) = listen(callback) {
                 error!("Keyboard listener error: {:?}", e);
             }
@@ -920,7 +903,6 @@ impl KeyboardLayoutSwitcher {
         if self.last_window_id == Some(window_id) { return Ok(()); }
 
         self.last_window_id = Some(window_id);
-
         self.char_buffer.lock().unwrap().clear();
         *self.buffer_window_id.lock().unwrap() = Some(window_id);
 
