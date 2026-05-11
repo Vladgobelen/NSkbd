@@ -1,6 +1,6 @@
 # NSKeyboardLayoutSwitcher
 
-Автоматический переключатель раскладки клавиатуры для Linux (X11) с запоминанием раскладки для каждого окна.
+Автоматический переключатель раскладки клавиатуры для Linux (X11) с запоминанием раскладки для каждого окна и исправлением опечаток.
 
 ## Возможности
 
@@ -9,43 +9,74 @@
 - CapsLock = English — одиночное нажатие CapsLock переключает на английскую раскладку
 - CapsLock + Space = Русский — удерживая CapsLock, нажать Space для переключения на русскую (с удалением последнего символа)
 - Множественный Shift — конвертирует последние слова в другую раскладку: 2 нажатия → 1 слово, 3 нажатия → 2 слова, и так далее до 10 нажатий. Работает в обе стороны
+- Исправление опечаток — после конвертации раскладки проверяет орфографию через PySpellChecker и исправляет опечатки (опционально, включается хоткеем)
 
 ## Установка
 
 ### Зависимости
-Ubuntu/Debian: sudo apt install xdotool xclip
-Arch: sudo pacman -S xdotool xclip
-Gentoo: emerge xdotool xclip
+
+Системные:
+- Ubuntu/Debian: sudo apt install xdotool
+- Arch: sudo pacman -S xdotool
+- Gentoo: emerge xdotool
+
+Python (для проверки орфографии):
+python -m venv .venv
+source .venv/bin/activate
+pip install pyspellchecker
+deactivate
 
 ### Сборка
-Установите Rust (https://rustup.rs), скачайте build.sh и запустите: sh build.sh
+
+Установите Rust (https://rustup.rs) и выполните:
+cargo build --release
+
+### Установка spell_server.py
+
+Скопируйте spell_server.py рядом с исполняемым файлом:
+cp spell_server.py target/release/
+
+Либо укажите путь к python с pyspellchecker в config.json:
+"python_interpreter": "/путь/к/.venv/bin/python3"
 
 ## Использование
 
 ### Запуск
-./NSKeyboardLayoutSwitcher &
+./target/release/NSKeyboardLayoutSwitcher &
 
 ### Команды
-./NSKeyboardLayoutSwitcher --add    # сохранить раскладку для текущего окна
+./target/release/NSKeyboardLayoutSwitcher --add    # сохранить раскладку для текущего окна
 
 ### Горячие клавиши
+
 CapsLock — переключить на английскую раскладку
 CapsLock + Space — переключить на русскую раскладку
-Shift × N (N ≥ 2) — конвертировать последние N−1 слов в другую раскладку
+Shift × N (N ≥ 2) — конвертировать последние N−1 слов в другую раскладку и исправить опечатки
 Ctrl + Shift + Q — запомнить раскладку для текущего окна
+Ctrl + Shift + L — включить/выключить проверку орфографии
 
 ### Конфиг (config.json, создаётся автоматически)
+
 {
   "window_layout_map": {"firefox": 0, "sublime_text": 1},
-  "hotkeys": {"add_window": "ctrl shift q"}
+  "hotkeys": {
+    "add_window": "ctrl shift q",
+    "toggle_spell": "ctrl shift l"
+  },
+  "enable_spell_check": false,
+  "python_interpreter": "/home/user/.venv/bin/python3"
 }
+
 0 = английская, 1 = русская
 
 ### Пример работы
+
 1. Открыли Firefox, включили русскую раскладку, нажали Ctrl+Shift+Q
 2. Перешли в терминал — раскладка переключилась на английскую
 3. Вернулись в Firefox — раскладка переключилась на русскую
 4. Набрали "ghbdtn", дважды нажали Shift — текст заменился на "привет"
+5. Включили проверку орфографии (Ctrl+Shift+L), набрали "дорбый", дважды нажали Shift — текст заменился на "добрый"
 
 ## Лицензия
+
 MIT
