@@ -880,6 +880,7 @@ impl KeyboardLayoutSwitcher {
     fn handle_window_change(&mut self, window_id: u32) -> Result<()> {
         if self.last_window_id == Some(window_id) { return Ok(()); }
 
+        info!("Window changed from {:?} to {}", self.last_window_id, window_id);
         self.last_window_id = Some(window_id);
         self.char_buffer.lock().unwrap().clear();
         *self.buffer_window_id.lock().unwrap() = Some(window_id);
@@ -887,11 +888,8 @@ impl KeyboardLayoutSwitcher {
         if let Some(window_class) = self.get_window_class(window_id) {
             let config = self.config.lock().map_err(|e| anyhow!("Config lock error: {}", e))?;
             if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
-                if let Some(current_layout) = self.get_current_layout() {
-                    if current_layout != target_layout {
-                        self.switch_layout(target_layout)?;
-                    }
-                }
+                info!("Switching to layout {} for window '{}'", target_layout, window_class);
+                self.switch_layout(target_layout)?;
             }
         }
         Ok(())
