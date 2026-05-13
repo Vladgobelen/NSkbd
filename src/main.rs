@@ -5,11 +5,12 @@ use rdev::{listen, Event as KbdEvent, EventType as RdevEventType};
 use rdev::Key as RdevKey;
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, WriteLogger};
+use std::io::Write as IoWrite;
 use std::{
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     net::TcpStream,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -158,13 +159,21 @@ struct KeyboardLayoutSwitcher {
     spell_checker: SpellChecker,
     replacing_text: Arc<Mutex<bool>>,
     server_process: Arc<Mutex<Option<Child>>>,
+    handling_window_change: Arc<Mutex<bool>>,
+    last_change_time: Arc<Mutex<Instant>>,
+    replacing_start_time: Arc<Mutex<Option<Instant>>>,
 }
 
 impl KeyboardLayoutSwitcher {
     fn new(config_file: &str, log_file: &str) -> Result<Self> {
+        info!("Initializing KeyboardLayoutSwitcher");
+
         let current_dir = env::current_dir().context("Failed to get current directory")?;
         let config_path = current_dir.join(config_file);
         let log_path = current_dir.join(log_file);
+
+        info!("Config path: {}", config_path.display());
+        info!("Log path: {}", log_path.display());
 
         if log_path.exists() {
             fs::remove_file(&log_path).ok();
@@ -176,15 +185,24 @@ impl KeyboardLayoutSwitcher {
         WriteLogger::init(LevelFilter::Info, LogConfig::default(), log_file)
             .context("Failed to initialize logger")?;
 
-        info!("NSKeyboardLayoutSwitcher started");
+        info!("Logger initialized");
 
         let config = AppConfig::load_from_file(&config_path)?;
+        info!("Config loaded: {} windows configured", config.window_layout_map.len());
 
+        info!("Connecting to X11 server...");
         let (conn, screen_num) = x11rb::connect(None).context("Failed to connect to X11 server")?;
         let conn = Arc::new(conn);
-        let xkb = XKeyboard::new(Arc::clone(&conn))?;
+        info!("Connected to X11, screen: {}", screen_num);
 
+        info!("Setting up XKB extension...");
+        let xkb = XKeyboard::new(Arc::clone(&conn))?;
+        info!("XKB extension ready");
+
+        info!("Creating virtual keyboard device...");
         let uinput = create_virtual_keyboard()?;
+        info!("Virtual keyboard created");
+
         let spell_checker = SpellChecker::new();
         let server_process = Arc::new(Mutex::new(None));
 
@@ -206,12 +224,22 @@ impl KeyboardLayoutSwitcher {
             spell_checker,
             replacing_text: Arc::new(Mutex::new(false)),
             server_process,
+            handling_window_change: Arc::new(Mutex::new(false)),
+            last_change_time: Arc::new(Mutex::new(Instant::now())),
+            replacing_start_time: Arc::new(Mutex::new(None)),
         };
 
         let enable_spell = {
-            let config = switcher.config.lock().unwrap();
+            let config = match switcher.config.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to lock config: {}", e);
+                    return Err(anyhow!("Config lock failed: {}", e));
+                }
+            };
             config.enable_spell_check
         };
+
         if enable_spell {
             switcher.spell_checker.set_enabled(true);
             match switcher.start_spell_server() {
@@ -220,6 +248,7 @@ impl KeyboardLayoutSwitcher {
             }
         }
 
+        info!("KeyboardLayoutSwitcher initialization complete");
         Ok(switcher)
     }
 
@@ -373,7 +402,7 @@ impl KeyboardLayoutSwitcher {
             Ok(p) => p,
             Err(_) => return Ok(()),
         };
-        
+
         if let Some(ref mut child) = *proc {
             match child.try_wait() {
                 Ok(None) => return Ok(()),
@@ -389,7 +418,7 @@ impl KeyboardLayoutSwitcher {
             let _ = Command::new("fuser")
                 .args(["-k", "9876/tcp"])
                 .output();
-            
+
             for _ in 0..20 {
                 thread::sleep(Duration::from_millis(500));
                 if TcpStream::connect_timeout(
@@ -425,7 +454,7 @@ impl KeyboardLayoutSwitcher {
                 error!("Failed to spawn spell server: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
@@ -452,28 +481,19 @@ impl KeyboardLayoutSwitcher {
             Ok(p) => p,
             Err(_) => return Ok(()),
         };
-        
+
         if let Some(ref mut child) = *proc {
             let _ = child.kill();
             let _ = child.wait();
             *proc = None;
             info!("Spell server stopped");
         }
-        
+
         Ok(())
     }
 
     fn switch_layout(&self, layout: u8) -> Result<()> {
         self.xkb.set_layout(layout)
-    }
-
-    fn send_backspace(&self) -> Result<()> {
-        let mut dev = self.uinput.lock().unwrap();
-        let bs = Key::KEY_BACKSPACE.code();
-        dev.emit(&[InputEvent::new(EventType::KEY, bs, 1)])?;
-        thread::sleep(Duration::from_millis(5));
-        dev.emit(&[InputEvent::new(EventType::KEY, bs, 0)])?;
-        Ok(())
     }
 
     fn type_text_uinput(&self, text: &str, layout: u8) -> Result<()> {
@@ -562,93 +582,230 @@ impl KeyboardLayoutSwitcher {
         if self.spell_checker.is_enabled() {
             let words: Vec<&str> = text.split_whitespace().collect();
             let mut corrected_words = Vec::new();
-            
+
             for word in &words {
                 let layout_converted = if Self::is_russian_word(word) {
                     word.to_string()
                 } else {
                     self.convert_layout(word)
                 };
-                
+
                 if let Some(llm_corrected) = self.spell_checker.check_word(&layout_converted) {
                     corrected_words.push(llm_corrected);
                 } else {
                     corrected_words.push(layout_converted);
                 }
             }
-            
+
             let result = corrected_words.join(" ");
             let is_ru = Self::is_russian_word(&result);
             return (result, is_ru);
         }
-        
+
         let converted = self.convert_layout(text);
         let is_ru = Self::is_russian_word(&converted);
         (converted, is_ru)
     }
 
     fn handle_shift_count(&self, count: usize) -> Result<()> {
+        info!("handle_shift_count: count={}", count);
+
         {
-            let mut replacing = self.replacing_text.lock().unwrap();
+            let mut replacing = match self.replacing_text.lock() {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("replacing_text mutex POISONED: {}", e);
+                    return Ok(());
+                }
+            };
+
             if *replacing {
+                if let Ok(mut start_time) = self.replacing_start_time.lock() {
+                    let force_reset = match *start_time {
+                        Some(t) => {
+                            let elapsed = t.elapsed();
+                            if elapsed > Duration::from_secs(5) {
+                                error!("Replacing flag stuck for {:.1}s, force resetting", elapsed.as_secs_f32());
+                                true
+                            } else {
+                                info!("Already replacing (elapsed {:.1}s), skipping", elapsed.as_secs_f32());
+                                false
+                            }
+                        }
+                        None => false,
+                    };
+
+                    if force_reset {
+                        *replacing = false;
+                        *start_time = None;
+                    } else {
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
+
+            *replacing = true;
+
+            if let Ok(mut start_time) = self.replacing_start_time.lock() {
+                *start_time = Some(Instant::now());
+            }
+        }
+
+        struct ReplacingGuard {
+            flag: Arc<Mutex<bool>>,
+            start_time: Arc<Mutex<Option<Instant>>>,
+        }
+
+        impl Drop for ReplacingGuard {
+            fn drop(&mut self) {
+                if let Ok(mut f) = self.flag.lock() {
+                    *f = false;
+                }
+                if let Ok(mut t) = self.start_time.lock() {
+                    *t = None;
+                }
+                info!("Replacing guard: cleaned up");
+            }
+        }
+
+        let _guard = ReplacingGuard {
+            flag: Arc::clone(&self.replacing_text),
+            start_time: Arc::clone(&self.replacing_start_time),
+        };
+
+        match self.shift_count.lock() {
+            Ok(mut c) => *c = 0,
+            Err(e) => {
+                error!("shift_count mutex POISONED: {}", e);
                 return Ok(());
             }
-            *replacing = true;
         }
 
-        *self.shift_count.lock().unwrap() = 0;
+        let words = count.saturating_sub(1);
+        info!("Converting last {} word(s)", words);
 
-        let words = count - 1;
-        
         let text_to_convert = {
-            let mut buf = self.char_buffer.lock().unwrap();
+            let buf = match self.char_buffer.lock() {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("char_buffer mutex POISONED: {}", e);
+                    return Ok(());
+                }
+            };
+
+            if buf.is_empty() {
+                info!("Buffer empty, nothing to convert");
+                return Ok(());
+            }
+
             let result = Self::take_last_n_words(&buf, words);
-            buf.clear();
+            drop(buf);
+
+            if let Ok(mut b) = self.char_buffer.lock() {
+                b.clear();
+            }
+
+            if result.is_empty() {
+                info!("No words extracted from buffer");
+                return Ok(());
+            }
+
+            info!("Extracted from buffer: '{}'", result);
             result
         };
-        
-        if text_to_convert.is_empty() {
-            *self.replacing_text.lock().unwrap() = false;
+
+        let actual_words = text_to_convert.split_whitespace().count();
+        if actual_words == 0 {
+            info!("No actual words to process");
             return Ok(());
         }
-        
-        let actual_words = text_to_convert.split_whitespace().count();
+
         let original_layout = self.get_current_layout().unwrap_or(0);
+        info!("Current layout: {}", original_layout);
+
         let (converted_text, converted_is_ru) = self.try_correct_last_word(&text_to_convert);
-        info!("Converted: '{}'", converted_text);
-        
+        info!("Converting: '{}' -> '{}' (is_ru={})", text_to_convert, converted_text, converted_is_ru);
+
         {
-            let mut dev = self.uinput.lock().unwrap();
+            let mut dev = match self.uinput.lock() {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("uinput mutex POISONED: {}", e);
+                    return Err(anyhow!("uinput lock failed: {}", e));
+                }
+            };
+
             let ctrl = Key::KEY_LEFTCTRL.code();
             let bs = Key::KEY_BACKSPACE.code();
-            
-            for _ in 0..actual_words {
-                dev.emit(&[InputEvent::new(EventType::KEY, ctrl, 1)])?;
+
+            info!("Deleting {} word(s)", actual_words);
+
+            for i in 0..actual_words {
+                info!("Deleting word {}/{}", i + 1, actual_words);
+
+                if let Err(e) = dev.emit(&[InputEvent::new(EventType::KEY, ctrl, 1)]) {
+                    error!("Failed to emit Ctrl press: {}", e);
+                    return Err(anyhow!("uinput emit failed: {}", e));
+                }
                 thread::sleep(Duration::from_millis(5));
-                dev.emit(&[InputEvent::new(EventType::KEY, bs, 1)])?;
+
+                if let Err(e) = dev.emit(&[InputEvent::new(EventType::KEY, bs, 1)]) {
+                    error!("Failed to emit Backspace press: {}", e);
+                    let _ = dev.emit(&[InputEvent::new(EventType::KEY, ctrl, 0)]);
+                    return Err(anyhow!("uinput emit failed: {}", e));
+                }
                 thread::sleep(Duration::from_millis(5));
-                dev.emit(&[InputEvent::new(EventType::KEY, bs, 0)])?;
+
+                if let Err(e) = dev.emit(&[InputEvent::new(EventType::KEY, bs, 0)]) {
+                    error!("Failed to emit Backspace release: {}", e);
+                    let _ = dev.emit(&[InputEvent::new(EventType::KEY, ctrl, 0)]);
+                    return Err(anyhow!("uinput emit failed: {}", e));
+                }
                 thread::sleep(Duration::from_millis(5));
-                dev.emit(&[InputEvent::new(EventType::KEY, ctrl, 0)])?;
+
+                if let Err(e) = dev.emit(&[InputEvent::new(EventType::KEY, ctrl, 0)]) {
+                    error!("Failed to emit Ctrl release: {}", e);
+                    return Err(anyhow!("uinput emit failed: {}", e));
+                }
                 thread::sleep(Duration::from_millis(30));
             }
+
+            info!("Deletion complete");
         }
-        
-        thread::sleep(Duration::from_millis(150));
-        
+
+        thread::sleep(Duration::from_millis(200));
+
         let target_layout = if converted_is_ru { 1 } else { 0 };
         if target_layout != original_layout {
-            self.switch_layout(target_layout)?;
+            info!("Switching layout from {} to {}", original_layout, target_layout);
+            if let Err(e) = self.switch_layout(target_layout) {
+                error!("Failed to switch layout: {}", e);
+                return Err(anyhow!("Layout switch failed: {}", e));
+            }
             thread::sleep(Duration::from_millis(100));
+        } else {
+            info!("Layout already correct ({})", target_layout);
         }
-        
-        self.char_buffer.lock().unwrap().clear();
-        self.type_text_uinput(&converted_text, target_layout)?;
-        
+
+        if let Ok(mut buf) = self.char_buffer.lock() {
+            buf.clear();
+        }
+
+        info!("Typing: '{}'", converted_text);
+        if let Err(e) = self.type_text_uinput(&converted_text, target_layout) {
+            error!("Failed to type text: {}", e);
+            return Err(anyhow!("Type text failed: {}", e));
+        }
+
         thread::sleep(Duration::from_millis(150));
-        self.char_buffer.lock().unwrap().clear();
-        
-        *self.replacing_text.lock().unwrap() = false;
+
+        if let Ok(mut buf) = self.char_buffer.lock() {
+            buf.clear();
+        }
+
+        info!("Replacement completed");
         Ok(())
     }
 
@@ -678,43 +835,51 @@ impl KeyboardLayoutSwitcher {
                         modifiers.update(&key, true);
 
                         if key == RdevKey::CapsLock {
-                            let mut count = caps_lock_count.lock().unwrap();
-                            *count += 1;
-                            *last_caps_lock_time.lock().unwrap() = Instant::now();
+                            if let Ok(mut count) = caps_lock_count.lock() {
+                                *count += 1;
+                            }
+                            if let Ok(mut last) = last_caps_lock_time.lock() {
+                                *last = Instant::now();
+                            }
                         }
 
                         if key == RdevKey::Space {
-                            let is_replacing = *replacing_text.lock().unwrap();
+                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
                             if !is_replacing {
-                                let mut buf = char_buffer.lock().unwrap();
-                                buf.push(' ');
-                                if buf.len() > MAX_CHARS {
-                                    *buf = buf[buf.len() - MAX_CHARS..].to_string();
+                                if let Ok(mut buf) = char_buffer.lock() {
+                                    buf.push(' ');
+                                    if buf.chars().count() > MAX_CHARS {
+                                        let skip = buf.chars().count() - MAX_CHARS;
+                                        *buf = buf.chars().skip(skip).collect();
+                                    }
                                 }
                             }
                         }
 
                         if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
-                            let is_replacing = *replacing_text.lock().unwrap();
+                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
                             if !is_replacing {
                                 let now = Instant::now();
-                                let mut last = last_shift_time.lock().unwrap();
-                                let mut count = shift_count.lock().unwrap();
-                                let elapsed = now.duration_since(*last);
-                                
-                                if *count > 0 && elapsed > Duration::from_millis(300) {
-                                    *count = 1;
-                                } else {
-                                    *count += 1;
+                                if let Ok(mut last) = last_shift_time.lock() {
+                                    if let Ok(mut count) = shift_count.lock() {
+                                        let elapsed = now.duration_since(*last);
+                                        if *count > 0 && elapsed > Duration::from_millis(300) {
+                                            *count = 1;
+                                        } else {
+                                            *count += 1;
+                                        }
+                                        *last = now;
+                                    }
                                 }
-                                *last = now;
                             }
                         }
 
                         if key != RdevKey::ShiftLeft && key != RdevKey::ShiftRight {
-                            let is_replacing = *replacing_text.lock().unwrap();
+                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
                             if !is_replacing {
-                                *shift_count.lock().unwrap() = 0;
+                                if let Ok(mut count) = shift_count.lock() {
+                                    *count = 0;
+                                }
                             }
                         }
 
@@ -726,38 +891,45 @@ impl KeyboardLayoutSwitcher {
                         }
 
                         if Self::is_typing_key(&key) {
-                            let is_replacing = *replacing_text.lock().unwrap();
+                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
                             if !is_replacing {
                                 let current_window = switcher.get_active_window();
-                                let mut buf_window = buffer_window_id.lock().unwrap();
-                                
-                                if *buf_window != current_window {
-                                    char_buffer.lock().unwrap().clear();
-                                    *buf_window = current_window;
+                                if let Ok(mut buf_window) = buffer_window_id.lock() {
+                                    if *buf_window != current_window {
+                                        if let Ok(mut buf) = char_buffer.lock() {
+                                            buf.clear();
+                                        }
+                                        *buf_window = current_window;
+                                    }
                                 }
-                                
+
                                 if let Some(c) = char_from_key(&key, modifiers.shift, current_layout_is_ru) {
-                                    let mut buf = char_buffer.lock().unwrap();
-                                    buf.push(c);
-                                    if buf.len() > MAX_CHARS {
-                                        *buf = buf[buf.len() - MAX_CHARS..].to_string();
+                                    if let Ok(mut buf) = char_buffer.lock() {
+                                        buf.push(c);
+                                        if buf.chars().count() > MAX_CHARS {
+                                            let skip = buf.chars().count() - MAX_CHARS;
+                                            *buf = buf.chars().skip(skip).collect();
+                                        }
                                     }
                                 }
                             }
                         }
 
                         if Self::is_boundary(&key) {
-                            let is_replacing = *replacing_text.lock().unwrap();
+                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
                             if !is_replacing {
-                                char_buffer.lock().unwrap().clear();
+                                if let Ok(mut buf) = char_buffer.lock() {
+                                    buf.clear();
+                                }
                             }
                         }
 
                         if key == RdevKey::Backspace {
-                            let is_replacing = *replacing_text.lock().unwrap();
+                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
                             if !is_replacing {
-                                let mut buf = char_buffer.lock().unwrap();
-                                buf.pop();
+                                if let Ok(mut buf) = char_buffer.lock() {
+                                    buf.pop();
+                                }
                             }
                         }
 
@@ -803,9 +975,7 @@ impl KeyboardLayoutSwitcher {
                         modifiers.update(&key, false);
 
                         if key == RdevKey::CapsLock {
-                            let captured_count = {
-                                *caps_lock_count.lock().unwrap()
-                            };
+                            let captured_count = caps_lock_count.lock().map(|c| *c).unwrap_or(0);
                             if captured_count > 0 {
                                 let switcher_clone = switcher.clone();
                                 let caps_count = Arc::clone(&caps_lock_count);
@@ -813,38 +983,40 @@ impl KeyboardLayoutSwitcher {
                                 let buf_win = Arc::clone(&buffer_window_id);
                                 thread::spawn(move || {
                                     thread::sleep(Duration::from_millis(300));
-                                    let final_count = *caps_count.lock().unwrap();
-                                    if final_count == captured_count {
-                                        if captured_count == 1 {
-                                            let _ = switcher_clone.switch_layout(0);
-                                        } else {
-                                            let _ = switcher_clone.switch_layout(1);
+                                    if let Ok(final_count) = caps_count.lock() {
+                                        if *final_count == captured_count {
+                                            if captured_count == 1 {
+                                                let _ = switcher_clone.switch_layout(0);
+                                            } else {
+                                                let _ = switcher_clone.switch_layout(1);
+                                            }
+                                            if let Ok(mut b) = char_buf.lock() { b.clear(); }
+                                            if let Ok(mut w) = buf_win.lock() { *w = None; }
+                                            if let Ok(mut c) = caps_count.lock() { *c = 0; }
                                         }
-                                        char_buf.lock().unwrap().clear();
-                                        *buf_win.lock().unwrap() = None;
-                                        *caps_count.lock().unwrap() = 0;
                                     }
                                 });
                             }
                         }
 
                         if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
-                            let is_replacing = *replacing_text.lock().unwrap();
+                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
                             if !is_replacing {
-                                let count = *shift_count.lock().unwrap();
-                                
+                                let count = shift_count.lock().map(|c| *c).unwrap_or(0);
+
                                 if count >= 2 {
                                     let switcher_clone = switcher.clone();
                                     let shift_check = Arc::clone(&shift_count);
                                     let captured_count = count.min(10) as usize;
-                                    
+
                                     thread::spawn(move || {
                                         thread::sleep(Duration::from_millis(300));
-                                        let final_count = *shift_check.lock().unwrap();
-                                        if final_count == captured_count as u32 {
-                                            *shift_check.lock().unwrap() = 0;
-                                            if let Err(e) = switcher_clone.handle_shift_count(captured_count) {
-                                                error!("Shift count error: {}", e);
+                                        if let Ok(final_count) = shift_check.lock() {
+                                            if *final_count == captured_count as u32 {
+                                                *shift_check.lock().unwrap() = 0;
+                                                if let Err(e) = switcher_clone.handle_shift_count(captured_count) {
+                                                    error!("Shift count error: {}", e);
+                                                }
                                             }
                                         }
                                     });
@@ -877,21 +1049,197 @@ impl KeyboardLayoutSwitcher {
         }
     }
 
+    fn apply_layout_to_window(&self, window_id: u32) -> Result<()> {
+        info!("apply_layout_to_window: window {}", window_id);
+
+        let active_window = self.get_active_window();
+        if active_window != Some(window_id) {
+            info!("Window {} no longer active (active: {:?}), skipping", window_id, active_window);
+            return Ok(());
+        }
+
+        if window_id == 0 {
+            return Ok(());
+        }
+
+        let window_class = match self.get_window_class(window_id) {
+            Some(wc) => wc,
+            None => {
+                info!("Window {} has no class, skipping", window_id);
+                return Ok(());
+            }
+        };
+
+        info!("Window {} class: '{}'", window_id, window_class);
+
+        let config = match self.config.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Config lock error in apply_layout: {}", e);
+                return Err(anyhow!("Config lock failed: {}", e));
+            }
+        };
+
+        if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
+            let current = match self.get_current_layout() {
+                Some(l) => l,
+                None => {
+                    error!("Failed to get current layout");
+                    return Err(anyhow!("Get layout failed"));
+                }
+            };
+
+            if current != target_layout {
+                info!("Delayed: switching to layout {} for '{}' (current={})", target_layout, window_class, current);
+                self.switch_layout(target_layout)?;
+                info!("Delayed layout switch successful");
+            } else {
+                info!("Delayed: layout already {}", current);
+            }
+        } else {
+            info!("Delayed: class '{}' not in config", window_class);
+        }
+
+        Ok(())
+    }
+
     fn handle_window_change(&mut self, window_id: u32) -> Result<()> {
-        if self.last_window_id == Some(window_id) { return Ok(()); }
+        info!("handle_window_change: window_id={}", window_id);
+
+        if self.last_window_id == Some(window_id) {
+            info!("Same window as before, skipping");
+            return Ok(());
+        }
+
+        if window_id == 0 {
+            info!("Ignoring window 0 (root/desktop)");
+            return Ok(());
+        }
+
+        {
+            let mut handling = match self.handling_window_change.lock() {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("handling_window_change mutex POISONED: {}", e);
+                    return Ok(());
+                }
+            };
+
+            if *handling {
+                info!("Already handling window change, queueing {}", window_id);
+                self.last_window_id = Some(window_id);
+                return Ok(());
+            }
+
+            let mut last_time = match self.last_change_time.lock() {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("last_change_time mutex POISONED: {}", e);
+                    return Ok(());
+                }
+            };
+
+            let elapsed = last_time.elapsed();
+            if elapsed < Duration::from_millis(100) {
+                info!("Window change too fast ({:.0}ms), delaying for window {}", elapsed.as_millis(), window_id);
+                self.last_window_id = Some(window_id);
+
+                let switcher_clone = self.clone();
+                let target_window = window_id;
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(200));
+                    if let Err(e) = switcher_clone.apply_layout_to_window(target_window) {
+                        error!("Delayed layout switch failed: {}", e);
+                    }
+                });
+
+                return Ok(());
+            }
+
+            *last_time = Instant::now();
+            *handling = true;
+        }
+
+        struct WindowChangeGuard {
+            flag: Arc<Mutex<bool>>,
+        }
+
+        impl Drop for WindowChangeGuard {
+            fn drop(&mut self) {
+                if let Ok(mut h) = self.flag.lock() {
+                    *h = false;
+                    info!("Window change guard: flag reset");
+                } else {
+                    error!("Window change guard: failed to reset flag");
+                }
+            }
+        }
+
+        let _guard = WindowChangeGuard {
+            flag: Arc::clone(&self.handling_window_change),
+        };
 
         info!("Window changed from {:?} to {}", self.last_window_id, window_id);
         self.last_window_id = Some(window_id);
-        self.char_buffer.lock().unwrap().clear();
-        *self.buffer_window_id.lock().unwrap() = Some(window_id);
 
-        if let Some(window_class) = self.get_window_class(window_id) {
-            let config = self.config.lock().map_err(|e| anyhow!("Config lock error: {}", e))?;
-            if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
-                info!("Switching to layout {} for window '{}'", target_layout, window_class);
-                self.switch_layout(target_layout)?;
-            }
+        match self.char_buffer.lock() {
+            Ok(mut buf) => {
+                buf.clear();
+                info!("Char buffer cleared");
+            },
+            Err(e) => error!("Failed to clear char buffer: {}", e),
         }
+
+        match self.buffer_window_id.lock() {
+            Ok(mut bw) => {
+                *bw = Some(window_id);
+                info!("Buffer window ID updated to {}", window_id);
+            },
+            Err(e) => error!("Failed to set buffer window ID: {}", e),
+        }
+
+        let window_class = match self.get_window_class(window_id) {
+            Some(wc) => {
+                info!("Window {} class: '{}'", window_id, wc);
+                wc
+            }
+            None => {
+                info!("Window {} has no class, skipping layout switch", window_id);
+                return Ok(());
+            }
+        };
+
+        let config = match self.config.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Config lock error: {}", e);
+                return Ok(());
+            }
+        };
+
+        if let Some(&target_layout) = config.window_layout_map.get(&window_class) {
+            let current = match self.get_current_layout() {
+                Some(l) => l,
+                None => {
+                    error!("Failed to get current layout");
+                    255
+                }
+            };
+
+            if current != target_layout {
+                info!("Switching to layout {} for '{}' (current={})", target_layout, window_class, current);
+                if let Err(e) = self.switch_layout(target_layout) {
+                    error!("Failed to switch layout: {}", e);
+                } else {
+                    info!("Layout switched successfully");
+                }
+            } else {
+                info!("Layout already {}", current);
+            }
+        } else {
+            info!("Window class '{}' not in config", window_class);
+        }
+
         Ok(())
     }
 
@@ -951,6 +1299,9 @@ impl Clone for KeyboardLayoutSwitcher {
             spell_checker: self.spell_checker.clone(),
             replacing_text: Arc::clone(&self.replacing_text),
             server_process: Arc::clone(&self.server_process),
+            handling_window_change: Arc::clone(&self.handling_window_change),
+            last_change_time: Arc::clone(&self.last_change_time),
+            replacing_start_time: Arc::clone(&self.replacing_start_time),
         }
     }
 }
@@ -1289,11 +1640,59 @@ fn create_virtual_keyboard() -> Result<evdev::uinput::VirtualDevice> {
 }
 
 fn main() -> Result<()> {
+    std::panic::set_hook(Box::new(|panic_info| {
+        use std::io::Write;
+
+        let location = panic_info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+
+        let panic_msg = format!("!!! PANIC at {:?}: {}", location, message);
+        eprintln!("{}", panic_msg);
+
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("kbd_switcher.log")
+        {
+            let _ = writeln!(file, "{}", panic_msg);
+            let _ = writeln!(file, "Stack backtrace:");
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            let _ = writeln!(file, "{}", backtrace);
+            let _ = file.flush();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }));
+
+    match run_app() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            error!("Application error: {}", e);
+            eprintln!("Error: {}", e);
+            for cause in e.chain() {
+                eprintln!("Caused by: {}", cause);
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_app() -> Result<()> {
+    info!("Starting NSKeyboardLayoutSwitcher");
+
     let mut switcher = KeyboardLayoutSwitcher::new("config.json", "kbd_switcher.log")?;
+
     if env::args().any(|arg| arg == "--add") {
         switcher.add_current_window()?;
     } else {
         switcher.run()?;
     }
+
     Ok(())
 }
