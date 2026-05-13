@@ -835,51 +835,44 @@ impl KeyboardLayoutSwitcher {
                         modifiers.update(&key, true);
 
                         if key == RdevKey::CapsLock {
-                            if let Ok(mut count) = caps_lock_count.lock() {
-                                *count += 1;
-                            }
-                            if let Ok(mut last) = last_caps_lock_time.lock() {
-                                *last = Instant::now();
-                            }
+                            let mut count = caps_lock_count.lock().unwrap();
+                            *count += 1;
+                            *last_caps_lock_time.lock().unwrap() = Instant::now();
                         }
 
                         if key == RdevKey::Space {
-                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
+                            let is_replacing = *replacing_text.lock().unwrap();
                             if !is_replacing {
-                                if let Ok(mut buf) = char_buffer.lock() {
-                                    buf.push(' ');
-                                    if buf.chars().count() > MAX_CHARS {
-                                        let skip = buf.chars().count() - MAX_CHARS;
-                                        *buf = buf.chars().skip(skip).collect();
-                                    }
+                                let mut buf = char_buffer.lock().unwrap();
+                                buf.push(' ');
+                                if buf.chars().count() > MAX_CHARS {
+                                    let skip = buf.chars().count() - MAX_CHARS;
+                                    *buf = buf.chars().skip(skip).collect();
                                 }
                             }
                         }
 
                         if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
-                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
+                            let is_replacing = *replacing_text.lock().unwrap();
                             if !is_replacing {
                                 let now = Instant::now();
-                                if let Ok(mut last) = last_shift_time.lock() {
-                                    if let Ok(mut count) = shift_count.lock() {
-                                        let elapsed = now.duration_since(*last);
-                                        if *count > 0 && elapsed > Duration::from_millis(300) {
-                                            *count = 1;
-                                        } else {
-                                            *count += 1;
-                                        }
-                                        *last = now;
-                                    }
+                                let mut last = last_shift_time.lock().unwrap();
+                                let mut count = shift_count.lock().unwrap();
+                                let elapsed = now.duration_since(*last);
+
+                                if *count > 0 && elapsed > Duration::from_millis(300) {
+                                    *count = 1;
+                                } else {
+                                    *count += 1;
                                 }
+                                *last = now;
                             }
                         }
 
                         if key != RdevKey::ShiftLeft && key != RdevKey::ShiftRight {
-                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
+                            let is_replacing = *replacing_text.lock().unwrap();
                             if !is_replacing {
-                                if let Ok(mut count) = shift_count.lock() {
-                                    *count = 0;
-                                }
+                                *shift_count.lock().unwrap() = 0;
                             }
                         }
 
@@ -891,45 +884,39 @@ impl KeyboardLayoutSwitcher {
                         }
 
                         if Self::is_typing_key(&key) {
-                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
+                            let is_replacing = *replacing_text.lock().unwrap();
                             if !is_replacing {
                                 let current_window = switcher.get_active_window();
-                                if let Ok(mut buf_window) = buffer_window_id.lock() {
-                                    if *buf_window != current_window {
-                                        if let Ok(mut buf) = char_buffer.lock() {
-                                            buf.clear();
-                                        }
-                                        *buf_window = current_window;
-                                    }
+                                let mut buf_window = buffer_window_id.lock().unwrap();
+
+                                if *buf_window != current_window {
+                                    char_buffer.lock().unwrap().clear();
+                                    *buf_window = current_window;
                                 }
 
                                 if let Some(c) = char_from_key(&key, modifiers.shift, current_layout_is_ru) {
-                                    if let Ok(mut buf) = char_buffer.lock() {
-                                        buf.push(c);
-                                        if buf.chars().count() > MAX_CHARS {
-                                            let skip = buf.chars().count() - MAX_CHARS;
-                                            *buf = buf.chars().skip(skip).collect();
-                                        }
+                                    let mut buf = char_buffer.lock().unwrap();
+                                    buf.push(c);
+                                    if buf.chars().count() > MAX_CHARS {
+                                        let skip = buf.chars().count() - MAX_CHARS;
+                                        *buf = buf.chars().skip(skip).collect();
                                     }
                                 }
                             }
                         }
 
                         if Self::is_boundary(&key) {
-                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
+                            let is_replacing = *replacing_text.lock().unwrap();
                             if !is_replacing {
-                                if let Ok(mut buf) = char_buffer.lock() {
-                                    buf.clear();
-                                }
+                                char_buffer.lock().unwrap().clear();
                             }
                         }
 
                         if key == RdevKey::Backspace {
-                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
+                            let is_replacing = *replacing_text.lock().unwrap();
                             if !is_replacing {
-                                if let Ok(mut buf) = char_buffer.lock() {
-                                    buf.pop();
-                                }
+                                let mut buf = char_buffer.lock().unwrap();
+                                buf.pop();
                             }
                         }
 
@@ -975,7 +962,9 @@ impl KeyboardLayoutSwitcher {
                         modifiers.update(&key, false);
 
                         if key == RdevKey::CapsLock {
-                            let captured_count = caps_lock_count.lock().map(|c| *c).unwrap_or(0);
+                            let captured_count = {
+                                *caps_lock_count.lock().unwrap()
+                            };
                             if captured_count > 0 {
                                 let switcher_clone = switcher.clone();
                                 let caps_count = Arc::clone(&caps_lock_count);
@@ -983,26 +972,25 @@ impl KeyboardLayoutSwitcher {
                                 let buf_win = Arc::clone(&buffer_window_id);
                                 thread::spawn(move || {
                                     thread::sleep(Duration::from_millis(300));
-                                    if let Ok(final_count) = caps_count.lock() {
-                                        if *final_count == captured_count {
-                                            if captured_count == 1 {
-                                                let _ = switcher_clone.switch_layout(0);
-                                            } else {
-                                                let _ = switcher_clone.switch_layout(1);
-                                            }
-                                            if let Ok(mut b) = char_buf.lock() { b.clear(); }
-                                            if let Ok(mut w) = buf_win.lock() { *w = None; }
-                                            if let Ok(mut c) = caps_count.lock() { *c = 0; }
+                                    let final_count = *caps_count.lock().unwrap();
+                                    if final_count == captured_count {
+                                        if captured_count == 1 {
+                                            let _ = switcher_clone.switch_layout(0);
+                                        } else {
+                                            let _ = switcher_clone.switch_layout(1);
                                         }
+                                        char_buf.lock().unwrap().clear();
+                                        *buf_win.lock().unwrap() = None;
+                                        *caps_count.lock().unwrap() = 0;
                                     }
                                 });
                             }
                         }
 
                         if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
-                            let is_replacing = replacing_text.lock().map(|r| *r).unwrap_or(false);
+                            let is_replacing = *replacing_text.lock().unwrap();
                             if !is_replacing {
-                                let count = shift_count.lock().map(|c| *c).unwrap_or(0);
+                                let count = *shift_count.lock().unwrap();
 
                                 if count >= 2 {
                                     let switcher_clone = switcher.clone();
@@ -1011,12 +999,11 @@ impl KeyboardLayoutSwitcher {
 
                                     thread::spawn(move || {
                                         thread::sleep(Duration::from_millis(300));
-                                        if let Ok(final_count) = shift_check.lock() {
-                                            if *final_count == captured_count as u32 {
-                                                *shift_check.lock().unwrap() = 0;
-                                                if let Err(e) = switcher_clone.handle_shift_count(captured_count) {
-                                                    error!("Shift count error: {}", e);
-                                                }
+                                        let final_count = *shift_check.lock().unwrap();
+                                        if final_count == captured_count as u32 {
+                                            *shift_check.lock().unwrap() = 0;
+                                            if let Err(e) = switcher_clone.handle_shift_count(captured_count) {
+                                                error!("Shift count error: {}", e);
                                             }
                                         }
                                     });
